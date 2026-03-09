@@ -6,6 +6,7 @@ import random
 import argparse
 from dataclasses import dataclass
 from typing import Optional
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -35,14 +36,24 @@ def configure_torch(device: torch.device, deterministic: bool = False) -> None:
             torch.set_float32_matmul_precision("high")
 
 
-class FedProtoNet(nn.Module):
+def get_autocast_context(device: torch.device, use_amp: bool):
+    if use_amp and device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+class BeamRegressor(nn.Module):
+    """
+    MLP that predicts the full normalized beam power vector.
+    Output logits are converted to a distribution with softmax.
+    """
+
     def __init__(
         self,
         num_features: int,
-        num_classes: int,
+        num_outputs: int,
         nodes_per_layer: int,
         n_layers: int,
-        embedding_dim: int,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -59,210 +70,33 @@ class FedProtoNet(nn.Module):
             in_dim = nodes_per_layer
 
         self.backbone = nn.Sequential(*layers)
-        self.embedding_layer = nn.Linear(in_dim, embedding_dim)
-        self.classifier = nn.Linear(embedding_dim, num_classes)
+        self.head = nn.Linear(in_dim, num_outputs)
 
-    def encode(self, x: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(x)
-        embedding = self.embedding_layer(features)
-        embedding = F.relu(embedding)
-        if normalize:
-            embedding = F.normalize(embedding, p=2, dim=1)
-        return embedding
-
-    def forward(self, x: torch.Tensor):
-        embedding = self.encode(x, normalize=True)
-        logits = self.classifier(embedding)
-        return logits, embedding
+        logits = self.head(features)
+        pred_dist = torch.softmax(logits, dim=1)
+        return logits, pred_dist
 
 
 @dataclass
 class ClientData:
     client_id: str
     train_loader: DataLoader
-    eval_train_loader: DataLoader
     num_samples: int
-
-
-class PrototypeAggregator:
-    def __init__(self, num_classes: int, embedding_dim: int):
-        self.num_classes = num_classes
-        self.embedding_dim = embedding_dim
-        self.global_prototypes: Optional[np.ndarray] = None
-        self.global_counts = np.zeros(self.num_classes, dtype=np.int64)
-
-    def aggregate(self, local_sums: list[np.ndarray], local_counts: list[np.ndarray]) -> np.ndarray:
-        total_sums = np.zeros((self.num_classes, self.embedding_dim), dtype=np.float64)
-        total_counts = np.zeros(self.num_classes, dtype=np.int64)
-
-        for sums, counts in zip(local_sums, local_counts):
-            total_sums += sums
-            total_counts += counts
-
-        prototypes = np.zeros((self.num_classes, self.embedding_dim), dtype=np.float32)
-        valid = total_counts > 0
-        prototypes[valid] = (total_sums[valid] / total_counts[valid, None]).astype(np.float32)
-
-        norms = np.linalg.norm(prototypes, axis=1, keepdims=True)
-        prototypes = prototypes / np.clip(norms, 1e-12, None)
-
-        self.global_prototypes = prototypes
-        self.global_counts = total_counts
-        return prototypes
-
-
-class BeamClient:
-    def __init__(
-        self,
-        client_data: ClientData,
-        device: torch.device,
-        lr: float,
-        decay_l2: float,
-        local_epochs: int,
-        lambda_proto: float,
-        use_amp: bool,
-        compile_model: bool,
-    ):
-        self.client_data = client_data
-        self.device = device
-        self.lr = lr
-        self.decay_l2 = decay_l2
-        self.local_epochs = local_epochs
-        self.lambda_proto = lambda_proto
-        self.use_amp = use_amp and device.type == "cuda"
-        self.compile_model = compile_model
-
-    def _build_local_model(self, global_model: nn.Module) -> nn.Module:
-        local_model = copy.deepcopy(global_model).to(self.device)
-        if self.compile_model and hasattr(torch, "compile"):
-            try:
-                local_model = torch.compile(local_model)
-            except Exception:
-                pass
-        return local_model
-
-    def local_train(
-        self,
-        global_model: nn.Module,
-        global_prototypes: Optional[np.ndarray],
-        global_counts: Optional[np.ndarray],
-    ) -> dict:
-        model = self._build_local_model(global_model)
-        model.train()
-
-        optimizer = optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
-        criterion = nn.CrossEntropyLoss()
-        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-
-        if global_prototypes is not None and global_counts is not None:
-            proto_tensor = torch.as_tensor(global_prototypes, dtype=torch.float32, device=self.device)
-            proto_mask = torch.as_tensor(global_counts > 0, dtype=torch.bool, device=self.device)
-        else:
-            proto_tensor = None
-            proto_mask = None
-
-        total_loss = 0.0
-        total_ce = 0.0
-        total_reg = 0.0
-        total_samples = 0
-
-        for _ in range(self.local_epochs):
-            for x_batch, y_batch in self.client_data.train_loader:
-                x_batch = x_batch.to(self.device, non_blocking=True)
-                y_batch = y_batch.to(self.device, non_blocking=True)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
-                    logits, embedding = model(x_batch)
-                    ce_loss = criterion(logits, y_batch)
-                    reg_loss = self.prototype_regularization(
-                        embedding=embedding,
-                        labels=y_batch,
-                        global_prototypes=proto_tensor,
-                        global_mask=proto_mask,
-                    )
-                    loss = ce_loss + self.lambda_proto * reg_loss
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                batch_size = x_batch.size(0)
-                total_loss += float(loss.detach().item()) * batch_size
-                total_ce += float(ce_loss.detach().item()) * batch_size
-                total_reg += float(reg_loss.detach().item()) * batch_size
-                total_samples += batch_size
-
-        proto_sums, proto_counts = self.compute_local_prototypes(model)
-
-        return {
-            "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-            "proto_sums": proto_sums,
-            "proto_counts": proto_counts,
-            "loss": total_loss / max(total_samples, 1),
-            "ce_loss": total_ce / max(total_samples, 1),
-            "reg_loss": total_reg / max(total_samples, 1),
-            "num_samples": self.client_data.num_samples,
-        }
-
-    def prototype_regularization(
-        self,
-        embedding: torch.Tensor,
-        labels: torch.Tensor,
-        global_prototypes: Optional[torch.Tensor],
-        global_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if global_prototypes is None or global_mask is None:
-            return embedding.new_zeros(())
-
-        valid = global_mask[labels]
-        if not torch.any(valid):
-            return embedding.new_zeros(())
-
-        selected_embeddings = embedding[valid]
-        selected_labels = labels[valid]
-        target_prototypes = global_prototypes[selected_labels]
-
-        return F.mse_loss(selected_embeddings, target_prototypes, reduction="mean")
-
-    def compute_local_prototypes(self, model: nn.Module) -> tuple[np.ndarray, np.ndarray]:
-        model.eval()
-        embedding_dim = model.classifier.in_features
-        proto_sums = torch.zeros(NUM_CLASSES, embedding_dim, device=self.device, dtype=torch.float32)
-        proto_counts = torch.zeros(NUM_CLASSES, device=self.device, dtype=torch.long)
-
-        with torch.no_grad():
-            for x_batch, y_batch in self.client_data.eval_train_loader:
-                x_batch = x_batch.to(self.device, non_blocking=True)
-                y_batch = y_batch.to(self.device, non_blocking=True)
-
-                with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
-                    embedding = model.encode(x_batch, normalize=True)
-
-                for class_id in y_batch.unique():
-                    class_index = int(class_id.item())
-                    class_mask = y_batch == class_id
-                    proto_sums[class_index] += embedding[class_mask].sum(dim=0)
-                    proto_counts[class_index] += int(class_mask.sum().item())
-
-        return (
-            proto_sums.cpu().numpy().astype(np.float64),
-            proto_counts.cpu().numpy().astype(np.int64),
-        )
 
 
 class TestDatasetBundle:
     def __init__(
         self,
         x_test: np.ndarray,
-        y_test: np.ndarray,
+        y_test_label: np.ndarray,
         y_test_norm: np.ndarray,
         power_sums: np.ndarray,
         client_ids: list[str],
     ):
         self.x_test = x_test
-        self.y_test = y_test
+        self.y_test_label = y_test_label
         self.y_test_norm = y_test_norm
         self.power_sums = power_sums
         self.client_ids = client_ids
@@ -270,12 +104,15 @@ class TestDatasetBundle:
 
 def load_client_arrays(csv_path: str):
     df = pd.read_csv(csv_path)
-    x = df[["gps_lat", "gps_long"]].values.astype(np.float32)
+
+    if "gps_lat" not in df.columns or "gps_long" not in df.columns:
+        raise ValueError(f"{csv_path} must contain gps_lat and gps_long columns")
 
     missing_cols = [col for col in PWR_COLS if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing power columns in {csv_path}: {missing_cols}")
 
+    x = df[["gps_lat", "gps_long"]].values.astype(np.float32)
     y_vec = df[PWR_COLS].values.astype(np.float32)
 
     if "power_sum" in df.columns:
@@ -284,25 +121,58 @@ def load_client_arrays(csv_path: str):
         power_sum = np.sum(y_vec, axis=1).astype(np.float32)
 
     y_norm = y_vec / (power_sum[:, None] + 1e-8)
-    labels = np.argmax(y_norm, axis=1).astype(np.int64)
+    y_label = np.argmax(y_norm, axis=1).astype(np.int64)
 
     if "client_id" in df.columns:
         client_ids = df["client_id"].astype(str).tolist()
     else:
         client_ids = [os.path.basename(csv_path)] * len(df)
 
-    return x, labels, y_norm, power_sum, client_ids
+    return x, y_label, y_norm, power_sum, client_ids
+
+
+def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndarray]:
+    train_paths = sorted(glob.glob(os.path.join(train_folder, "*.csv")))
+    if not train_paths:
+        raise FileNotFoundError(f"No train CSV files found in {train_folder}")
+
+    total_count = 0
+    sum_x = np.zeros(2, dtype=np.float64)
+    sum_x2 = np.zeros(2, dtype=np.float64)
+
+    for csv_path in train_paths:
+        df = pd.read_csv(csv_path, usecols=["gps_lat", "gps_long"])
+        x = df[["gps_lat", "gps_long"]].values.astype(np.float64)
+        total_count += x.shape[0]
+        sum_x += x.sum(axis=0)
+        sum_x2 += (x ** 2).sum(axis=0)
+
+    mean = sum_x / max(total_count, 1)
+    var = sum_x2 / max(total_count, 1) - mean ** 2
+    std = np.sqrt(np.maximum(var, 1e-12))
+
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def normalize_features(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return ((x - mean[None, :]) / np.clip(std[None, :], 1e-8, None)).astype(np.float32)
 
 
 def make_dataloader(
     x: np.ndarray,
-    y: np.ndarray,
+    y_norm: np.ndarray,
+    y_label: np.ndarray,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
 ) -> DataLoader:
-    dataset = TensorDataset(torch.from_numpy(x), torch.from_numpy(y))
+    dataset = TensorDataset(
+        torch.from_numpy(x),
+        torch.from_numpy(y_norm),
+        torch.from_numpy(y_label),
+    )
+
     persistent_workers = bool(num_workers > 0)
 
     return DataLoader(
@@ -313,78 +183,6 @@ def make_dataloader(
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         drop_last=False,
-    )
-
-
-def build_clients(args: argparse.Namespace, device: torch.device) -> list[BeamClient]:
-    train_paths = sorted(glob.glob(os.path.join(args.train_folder, "*.csv")))
-    if not train_paths:
-        raise FileNotFoundError(f"No train CSV files found in {args.train_folder}")
-
-    clients = []
-    for train_csv in train_paths:
-        x_train, y_train, _, _, train_client_ids = load_client_arrays(train_csv)
-        client_id = str(train_client_ids[0]) if len(train_client_ids) > 0 else f"client_{len(clients)}"
-
-        train_loader = make_dataloader(
-            x_train,
-            y_train,
-            args.batch_size,
-            True,
-            args.num_workers,
-            device.type == "cuda",
-        )
-        eval_train_loader = make_dataloader(
-            x_train,
-            y_train,
-            args.batch_size,
-            False,
-            args.num_workers,
-            device.type == "cuda",
-        )
-
-        client_data = ClientData(
-            client_id=client_id,
-            train_loader=train_loader,
-            eval_train_loader=eval_train_loader,
-            num_samples=len(y_train),
-        )
-
-        client = BeamClient(
-            client_data=client_data,
-            device=device,
-            lr=args.lr,
-            decay_l2=args.decay_l2,
-            local_epochs=args.local_epochs,
-            lambda_proto=args.lambda_proto,
-            use_amp=args.use_amp,
-            compile_model=args.compile_model,
-        )
-        clients.append(client)
-
-    return clients
-
-
-def load_all_test_data(test_folder: str) -> TestDatasetBundle:
-    test_paths = sorted(glob.glob(os.path.join(test_folder, "*.csv")))
-    if not test_paths:
-        raise FileNotFoundError(f"No test CSV files found in {test_folder}")
-
-    xs, ys, y_norms, power_sums, client_ids = [], [], [], [], []
-    for test_csv in test_paths:
-        x_test, y_test, y_test_norm, ps_test, ids_test = load_client_arrays(test_csv)
-        xs.append(x_test)
-        ys.append(y_test)
-        y_norms.append(y_test_norm)
-        power_sums.append(ps_test)
-        client_ids.extend(ids_test)
-
-    return TestDatasetBundle(
-        x_test=np.vstack(xs),
-        y_test=np.concatenate(ys),
-        y_test_norm=np.vstack(y_norms),
-        power_sums=np.concatenate(power_sums),
-        client_ids=client_ids,
     )
 
 
@@ -407,7 +205,7 @@ def weighted_average_state_dicts(
     local_num_samples: list[int],
 ) -> dict[str, torch.Tensor]:
     if not local_state_dicts:
-        raise ValueError("No local state dicts provided for FedAvg aggregation")
+        raise ValueError("No local state dicts provided for aggregation")
 
     total_samples = float(sum(local_num_samples))
     avg_state = {}
@@ -424,74 +222,12 @@ def weighted_average_state_dicts(
     return avg_state
 
 
-def maybe_get_lambda_proto(args: argparse.Namespace, round_idx: int) -> float:
-    if not args.lambda_warmup:
-        return args.lambda_proto
-
-    warmup_rounds = max(1, args.lambda_warmup_rounds)
-    progress = min(round_idx / warmup_rounds, 1.0)
-    return float(args.lambda_proto * progress)
-
-
-def federated_train(
-    args: argparse.Namespace,
-    clients: list[BeamClient],
-    global_model: nn.Module,
-) -> tuple[nn.Module, PrototypeAggregator]:
-    aggregator = PrototypeAggregator(num_classes=NUM_CLASSES, embedding_dim=args.embedding_dim)
-
-    for round_idx in range(1, args.rounds + 1):
-        selected_clients = select_participating_clients(
-            num_clients=len(clients),
-            fraction_fit=args.fraction_fit,
-            seed=args.seed,
-            round_idx=round_idx,
-        )
-
-        current_lambda_proto = maybe_get_lambda_proto(args, round_idx)
-
-        local_state_dicts = []
-        local_num_samples = []
-        local_sums = []
-        local_counts = []
-        round_losses = []
-        round_ce_losses = []
-        round_reg_losses = []
-
-        for client_idx in selected_clients:
-            clients[client_idx].lambda_proto = current_lambda_proto
-
-            result = clients[client_idx].local_train(
-                global_model=global_model,
-                global_prototypes=aggregator.global_prototypes,
-                global_counts=aggregator.global_counts,
-            )
-
-            local_state_dicts.append(result["state_dict"])
-            local_num_samples.append(result["num_samples"])
-            local_sums.append(result["proto_sums"])
-            local_counts.append(result["proto_counts"])
-            round_losses.append(result["loss"])
-            round_ce_losses.append(result["ce_loss"])
-            round_reg_losses.append(result["reg_loss"])
-
-        new_global_state = weighted_average_state_dicts(local_state_dicts, local_num_samples)
-        global_model.load_state_dict(new_global_state, strict=True)
-
-        aggregator.aggregate(local_sums, local_counts)
-        valid_classes = int((aggregator.global_counts > 0).sum())
-
-        print(
-            f"Round {round_idx:03d}/{args.rounds} | "
-            f"clients={len(selected_clients)} | "
-            f"lambda_proto={current_lambda_proto:.4f} | "
-            f"loss={np.mean(round_losses):.4f} | "
-            f"ce={np.mean(round_ce_losses):.4f} | "
-            f"reg={np.mean(round_reg_losses):.4f} | "
-            f"valid_classes={valid_classes}"
-        )
-
-    return global_model, aggregator
+def weighted_mean(values: list[float], weights: list[int]) -> float:
+    if len(values) == 0:
+        return float("nan")
+    values_arr = np.asarray(values, dtype=np.float64)
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    return float(np.sum(values_arr * weights_arr) / np.sum(weights_arr))
 
 
 def compute_power_loss_db(selected_indices: list[int], true_vec_norm: np.ndarray, power_sum: float) -> float:
@@ -509,34 +245,279 @@ def compute_power_loss_db(selected_indices: list[int], true_vec_norm: np.ndarray
     return float(10.0 * np.log10((true_max - noise) / (measured_power - noise)))
 
 
+def prediction_loss(
+    pred_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    loss_name: str,
+) -> torch.Tensor:
+    if loss_name == "mse":
+        return F.mse_loss(pred_dist, target_dist, reduction="mean")
+
+    if loss_name == "smoothl1":
+        return F.smooth_l1_loss(pred_dist, target_dist, reduction="mean")
+
+    if loss_name == "kl":
+        log_pred = torch.log(pred_dist.clamp_min(1e-8))
+        return F.kl_div(log_pred, target_dist, reduction="batchmean")
+
+    raise ValueError(f"Unsupported loss: {loss_name}")
+
+
+class BeamClient:
+    def __init__(
+        self,
+        client_data: ClientData,
+        device: torch.device,
+        lr: float,
+        decay_l2: float,
+        local_epochs: int,
+        use_amp: bool,
+        fl_method: str,
+        prox_mu: float,
+        local_optimizer: str,
+    ):
+        self.client_data = client_data
+        self.device = device
+        self.lr = lr
+        self.decay_l2 = decay_l2
+        self.local_epochs = local_epochs
+        self.use_amp = use_amp and device.type == "cuda"
+        self.fl_method = fl_method
+        self.prox_mu = prox_mu
+        self.local_optimizer = local_optimizer.lower()
+
+    def _build_local_model(self, global_model: nn.Module) -> nn.Module:
+        return copy.deepcopy(global_model).to(self.device)
+
+    def _make_optimizer(self, model: nn.Module):
+        if self.local_optimizer == "adam":
+            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
+        if self.local_optimizer == "adamw":
+            return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
+        if self.local_optimizer == "sgd":
+            return optim.SGD(model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.decay_l2)
+        raise ValueError(f"Unsupported optimizer: {self.local_optimizer}")
+
+    def _proximal_term(
+        self,
+        local_model: nn.Module,
+        global_params: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        prox = torch.zeros((), device=self.device)
+        for name, param in local_model.named_parameters():
+            prox = prox + torch.sum((param - global_params[name]) ** 2)
+        return 0.5 * self.prox_mu * prox
+
+    def local_train(
+        self,
+        global_model: nn.Module,
+        loss_name: str,
+    ) -> dict:
+        model = self._build_local_model(global_model)
+        model.train()
+
+        optimizer = self._make_optimizer(model)
+        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
+        if self.fl_method == "fedprox":
+            global_params = {
+                name: param.detach().clone().to(self.device)
+                for name, param in global_model.named_parameters()
+            }
+        else:
+            global_params = None
+
+        total_loss = 0.0
+        total_main_loss = 0.0
+        total_prox_loss = 0.0
+        total_samples = 0
+
+        for _ in range(self.local_epochs):
+            for x_batch, y_dist_batch, _ in self.client_data.train_loader:
+                x_batch = x_batch.to(self.device, non_blocking=True)
+                y_dist_batch = y_dist_batch.to(self.device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                with get_autocast_context(self.device, self.use_amp):
+                    _, pred_dist = model(x_batch)
+                    main_loss = prediction_loss(pred_dist, y_dist_batch, loss_name)
+
+                    if self.fl_method == "fedprox":
+                        prox_loss = self._proximal_term(model, global_params)
+                    else:
+                        prox_loss = torch.zeros((), device=self.device)
+
+                    loss = main_loss + prox_loss
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                batch_size = x_batch.size(0)
+                total_loss += float(loss.detach().item()) * batch_size
+                total_main_loss += float(main_loss.detach().item()) * batch_size
+                total_prox_loss += float(prox_loss.detach().item()) * batch_size
+                total_samples += batch_size
+
+        return {
+            "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "loss": total_loss / max(total_samples, 1),
+            "main_loss": total_main_loss / max(total_samples, 1),
+            "prox_loss": total_prox_loss / max(total_samples, 1),
+            "num_samples": self.client_data.num_samples,
+        }
+
+
+def build_clients(
+    args: argparse.Namespace,
+    device: torch.device,
+    x_mean: Optional[np.ndarray],
+    x_std: Optional[np.ndarray],
+) -> list[BeamClient]:
+    train_paths = sorted(glob.glob(os.path.join(args.train_folder, "*.csv")))
+    if not train_paths:
+        raise FileNotFoundError(f"No train CSV files found in {args.train_folder}")
+
+    clients = []
+    for train_csv in train_paths:
+        x_train, y_train_label, y_train_norm, _, train_client_ids = load_client_arrays(train_csv)
+
+        if args.standardize_x:
+            x_train = normalize_features(x_train, x_mean, x_std)
+
+        client_id = str(train_client_ids[0]) if len(train_client_ids) > 0 else f"client_{len(clients)}"
+
+        train_loader = make_dataloader(
+            x_train,
+            y_train_norm,
+            y_train_label,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        client_data = ClientData(
+            client_id=client_id,
+            train_loader=train_loader,
+            num_samples=len(y_train_label),
+        )
+
+        client = BeamClient(
+            client_data=client_data,
+            device=device,
+            lr=args.lr,
+            decay_l2=args.decay_l2,
+            local_epochs=args.local_epochs,
+            use_amp=args.use_amp,
+            fl_method=args.fl_method,
+            prox_mu=args.prox_mu,
+            local_optimizer=args.local_optimizer,
+        )
+        clients.append(client)
+
+    return clients
+
+
+def load_all_test_data(
+    test_folder: str,
+    standardize_x: bool,
+    x_mean: Optional[np.ndarray],
+    x_std: Optional[np.ndarray],
+) -> TestDatasetBundle:
+    test_paths = sorted(glob.glob(os.path.join(test_folder, "*.csv")))
+    if not test_paths:
+        raise FileNotFoundError(f"No test CSV files found in {test_folder}")
+
+    xs, ys_label, y_norms, power_sums, client_ids = [], [], [], [], []
+
+    for test_csv in test_paths:
+        x_test, y_test_label, y_test_norm, ps_test, ids_test = load_client_arrays(test_csv)
+
+        if standardize_x:
+            x_test = normalize_features(x_test, x_mean, x_std)
+
+        xs.append(x_test)
+        ys_label.append(y_test_label)
+        y_norms.append(y_test_norm)
+        power_sums.append(ps_test)
+        client_ids.extend(ids_test)
+
+    return TestDatasetBundle(
+        x_test=np.vstack(xs),
+        y_test_label=np.concatenate(ys_label),
+        y_test_norm=np.vstack(y_norms),
+        power_sums=np.concatenate(power_sums),
+        client_ids=client_ids,
+    )
+
+
+def federated_train(
+    args: argparse.Namespace,
+    clients: list[BeamClient],
+    global_model: nn.Module,
+) -> nn.Module:
+    for round_idx in range(1, args.rounds + 1):
+        selected_clients = select_participating_clients(
+            num_clients=len(clients),
+            fraction_fit=args.fraction_fit,
+            seed=args.seed,
+            round_idx=round_idx,
+        )
+
+        local_state_dicts = []
+        local_num_samples = []
+        round_losses = []
+        round_main_losses = []
+        round_prox_losses = []
+
+        for client_idx in selected_clients:
+            result = clients[client_idx].local_train(
+                global_model=global_model,
+                loss_name=args.loss,
+            )
+
+            local_state_dicts.append(result["state_dict"])
+            local_num_samples.append(result["num_samples"])
+            round_losses.append(result["loss"])
+            round_main_losses.append(result["main_loss"])
+            round_prox_losses.append(result["prox_loss"])
+
+        new_global_state = weighted_average_state_dicts(local_state_dicts, local_num_samples)
+        global_model.load_state_dict(new_global_state, strict=True)
+
+        print(
+            f"Round {round_idx:03d}/{args.rounds} | "
+            f"method={args.fl_method} | "
+            f"clients={len(selected_clients)} | "
+            f"loss={weighted_mean(round_losses, local_num_samples):.6f} | "
+            f"main={weighted_mean(round_main_losses, local_num_samples):.6f} | "
+            f"prox={weighted_mean(round_prox_losses, local_num_samples):.6f}"
+        )
+
+    return global_model
+
+
 def evaluate_and_save(
     args: argparse.Namespace,
     global_model: nn.Module,
-    aggregator: PrototypeAggregator,
     test_bundle: TestDatasetBundle,
     device: torch.device,
+    x_mean: Optional[np.ndarray],
+    x_std: Optional[np.ndarray],
 ) -> None:
-    if aggregator.global_prototypes is None:
-        raise RuntimeError("Global prototypes are not available. Training did not run correctly.")
-
     global_model.eval()
     global_model.to(device)
 
-    global_prototypes = torch.as_tensor(aggregator.global_prototypes, dtype=torch.float32, device=device)
-    valid_mask = torch.as_tensor(aggregator.global_counts > 0, dtype=torch.bool, device=device)
-
-    if args.use_classifier_head:
-        print("Evaluation mode: classifier head")
-    else:
-        print("Evaluation mode: nearest prototype")
-
     test_loader = make_dataloader(
         test_bundle.x_test,
-        test_bundle.y_test,
-        args.batch_size,
-        False,
-        args.num_workers,
-        device.type == "cuda",
+        test_bundle.y_test_norm,
+        test_bundle.y_test_label,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
 
     metrics_rows = []
@@ -544,23 +525,16 @@ def evaluate_and_save(
     sample_offset = 0
 
     with torch.no_grad():
-        for x_batch, y_batch in test_loader:
+        for x_batch, _, y_label_batch in test_loader:
             batch_size = x_batch.size(0)
             x_batch = x_batch.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type="cuda", enabled=(args.use_amp and device.type == "cuda")):
-                if args.use_classifier_head:
-                    logits, _ = global_model(x_batch)
-                    scores = logits.float()
-                    scores[:, ~valid_mask] = -torch.inf
-                    topk_indices = torch.topk(scores, k=max_top_k, largest=True, dim=1).indices.cpu().numpy()
-                else:
-                    embedding = global_model.encode(x_batch, normalize=True)
-                    distances = torch.cdist(embedding.float(), global_prototypes.float(), p=2.0).pow(2)
-                    distances[:, ~valid_mask] = torch.inf
-                    topk_indices = torch.topk(distances, k=max_top_k, largest=False, dim=1).indices.cpu().numpy()
+            with get_autocast_context(device, args.use_amp and device.type == "cuda"):
+                _, pred_dist = global_model(x_batch)
 
-            y_true_batch = y_batch.numpy()
+            pred_dist_np = pred_dist.float().cpu().numpy()
+            topk_indices = np.argsort(-pred_dist_np, axis=1)[:, :max_top_k]
+            y_true_batch = y_label_batch.numpy()
 
             for i in range(batch_size):
                 global_idx = sample_offset + i
@@ -579,7 +553,9 @@ def evaluate_and_save(
                     "selected_indices_topk": json.dumps(selected_topk),
                     "true_best": true_best,
                     "predicted_best": int(selected_topk[0]),
-                    "best_power": float(test_bundle.y_test_norm[global_idx, true_best] * test_bundle.power_sums[global_idx]),
+                    "best_power": float(
+                        test_bundle.y_test_norm[global_idx, true_best] * test_bundle.power_sums[global_idx]
+                    ),
                     f"power_loss_db_top{args.power_loss_k}": power_loss_db,
                 }
 
@@ -598,11 +574,13 @@ def evaluate_and_save(
 
     summary = {
         "num_samples": int(len(metrics_df)),
-        "num_train_clients": int(len(glob.glob(os.path.join(args.train_folder, '*.csv')))),
-        "lambda_proto": float(args.lambda_proto),
-        "embedding_dim": int(args.embedding_dim),
+        "num_train_clients": int(len(glob.glob(os.path.join(args.train_folder, "*.csv")))),
+        "fl_method": args.fl_method,
+        "loss": args.loss,
+        "prox_mu": float(args.prox_mu),
+        "local_optimizer": args.local_optimizer,
+        "standardize_x": bool(args.standardize_x),
         "power_loss_k": int(args.power_loss_k),
-        "evaluation_mode": "classifier_head" if args.use_classifier_head else "nearest_prototype",
     }
 
     for k in range(1, max_top_k + 1):
@@ -616,25 +594,23 @@ def evaluate_and_save(
     summary_path = os.path.join(args.output_dir, "summary.csv")
     summary_df.to_csv(summary_path, index=False)
 
+    run_config = vars(args).copy()
+    if x_mean is not None:
+        run_config["x_mean"] = [float(v) for v in x_mean]
+    if x_std is not None:
+        run_config["x_std"] = [float(v) for v in x_std]
+
     config_path = os.path.join(args.output_dir, "run_config.json")
     with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(run_config, f, indent=2)
 
     model_path = os.path.join(args.output_dir, "global_model.pt")
     torch.save(global_model.state_dict(), model_path)
-
-    proto_path = os.path.join(args.output_dir, "global_prototypes.npy")
-    np.save(proto_path, aggregator.global_prototypes)
-
-    counts_path = os.path.join(args.output_dir, "global_proto_counts.npy")
-    np.save(counts_path, aggregator.global_counts)
 
     print(f"\nPer-sample metrics saved to {metrics_path}")
     print(f"Summary saved to {summary_path}")
     print(f"Run config saved to {config_path}")
     print(f"Global model saved to {model_path}")
-    print(f"Global prototypes saved to {proto_path}")
-    print(f"Prototype counts saved to {counts_path}")
 
     print("\nTop-k accuracy summary:")
     for k in range(1, max_top_k + 1):
@@ -643,15 +619,16 @@ def evaluate_and_save(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FedAvg + FedProto beam selection from GPS positions")
+    parser = argparse.ArgumentParser(
+        description="Federated regression of full normalized beam vector (FedAvg / FedProx)"
+    )
 
     parser.add_argument("--train_folder", type=str, default="deepSense/train_sequences_scen1")
     parser.add_argument("--test_folder", type=str, default="deepSense/test_sequences_scen1")
-    parser.add_argument("--output_dir", type=str, default="results_ssh")
+    parser.add_argument("--output_dir", type=str, default="results_regression")
 
     parser.add_argument("--nodes_per_layer", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
-    parser.add_argument("--embedding_dim", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.0)
 
     parser.add_argument("--batch_size", type=int, default=256)
@@ -662,21 +639,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_epochs", type=int, default=1)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
-    parser.add_argument("--lambda_proto", type=float, default=0.05)
-    parser.add_argument("--lambda_warmup", action="store_true")
-    parser.add_argument("--lambda_warmup_rounds", type=int, default=20)
+    parser.add_argument("--fl_method", type=str, default="fedavg", choices=["fedavg", "fedprox"])
+    parser.add_argument("--prox_mu", type=float, default=1e-3)
+
+    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1", "kl"])
+    parser.add_argument("--local_optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
 
     parser.add_argument("--max_top_k", type=int, default=10)
     parser.add_argument("--power_loss_k", type=int, default=10)
+
+    parser.add_argument("--standardize_x", action="store_true")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
 
     parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--compile_model", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
-
-    parser.add_argument("--use_classifier_head", action="store_true")
 
     return parser.parse_args()
 
@@ -684,8 +662,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if args.max_top_k < 1:
-        raise ValueError("max_top_k must be at least 1")
+    if args.max_top_k < 1 or args.max_top_k > NUM_CLASSES:
+        raise ValueError(f"max_top_k must be in [1, {NUM_CLASSES}]")
     if args.power_loss_k < 1 or args.power_loss_k > args.max_top_k:
         raise ValueError("power_loss_k must be in [1, max_top_k]")
     if args.fraction_fit <= 0 or args.fraction_fit > 1.0:
@@ -699,30 +677,37 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"Train folder: {args.train_folder}")
     print(f"Test folder:  {args.test_folder}")
+    print(f"Federated method: {args.fl_method}")
+    print(f"Loss: {args.loss}")
 
-    global_model = FedProtoNet(
+    if args.standardize_x:
+        x_mean, x_std = compute_global_feature_stats(args.train_folder)
+        print(f"Feature standardization enabled | mean={x_mean.tolist()} | std={x_std.tolist()}")
+    else:
+        x_mean, x_std = None, None
+        print("Feature standardization disabled")
+
+    global_model = BeamRegressor(
         num_features=2,
-        num_classes=NUM_CLASSES,
+        num_outputs=NUM_CLASSES,
         nodes_per_layer=args.nodes_per_layer,
         n_layers=args.layers,
-        embedding_dim=args.embedding_dim,
         dropout=args.dropout,
     ).to(device)
 
-    if args.compile_model and hasattr(torch, "compile"):
-        try:
-            global_model = torch.compile(global_model)
-        except Exception:
-            pass
-
-    clients = build_clients(args, device)
+    clients = build_clients(args, device, x_mean, x_std)
     print(f"Built {len(clients)} training clients")
 
-    test_bundle = load_all_test_data(args.test_folder)
-    print(f"Loaded {len(test_bundle.y_test)} test samples from {args.test_folder}")
+    test_bundle = load_all_test_data(
+        test_folder=args.test_folder,
+        standardize_x=args.standardize_x,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+    print(f"Loaded {len(test_bundle.y_test_label)} test samples from {args.test_folder}")
 
-    global_model, aggregator = federated_train(args, clients, global_model)
-    evaluate_and_save(args, global_model, aggregator, test_bundle, device)
+    global_model = federated_train(args, clients, global_model)
+    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std)
 
 
 if __name__ == "__main__":
