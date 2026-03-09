@@ -628,18 +628,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default="results_regression")
 
     parser.add_argument("--nodes_per_layer", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=3)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--layers", type=int, default=7)
+    parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--decay_l2", type=float, default=1e-5)
 
     parser.add_argument("--rounds", type=int, default=150)
-    parser.add_argument("--local_epochs", type=int, default=1)
+    parser.add_argument("--local_epochs", type=int, default=5)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
-    parser.add_argument("--fl_method", type=str, default="fedavg", choices=["fedavg", "fedprox"])
+    parser.add_argument("--fl_method", type=str, default="fedprox", choices=["fedavg", "fedprox"])
     parser.add_argument("--prox_mu", type=float, default=1e-3)
 
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1", "kl"])
