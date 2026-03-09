@@ -5,8 +5,8 @@ import copy
 import random
 import argparse
 from dataclasses import dataclass
-from typing import Optional
 from contextlib import nullcontext
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -44,8 +44,7 @@ def get_autocast_context(device: torch.device, use_amp: bool):
 
 class BeamRegressor(nn.Module):
     """
-    MLP that predicts the full normalized beam power vector.
-    Output logits are converted to a distribution with softmax.
+    MLP that predicts the full 64-dimensional beam power vector in dB scale.
     """
 
     def __init__(
@@ -72,7 +71,7 @@ class BeamRegressor(nn.Module):
         self.backbone = nn.Sequential(*layers)
         self.head = nn.Linear(in_dim, num_outputs)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.backbone(x)
         outputs = self.head(features)
         return outputs
@@ -90,18 +89,27 @@ class TestDatasetBundle:
         self,
         x_test: np.ndarray,
         y_test_label: np.ndarray,
-        y_test_norm: np.ndarray,
+        y_test_db: np.ndarray,
+        y_test_norm_linear: np.ndarray,
+        y_test_linear: np.ndarray,
         power_sums: np.ndarray,
         client_ids: list[str],
     ):
         self.x_test = x_test
         self.y_test_label = y_test_label
-        self.y_test_norm = y_test_norm
+        self.y_test_db = y_test_db
+        self.y_test_norm_linear = y_test_norm_linear
+        self.y_test_linear = y_test_linear
         self.power_sums = power_sums
         self.client_ids = client_ids
 
 
-def load_client_arrays(csv_path: str):
+def load_client_arrays(
+    csv_path: str,
+    target_mean: Optional[float] = None,
+    target_std: Optional[float] = None,
+    assume_powers_are_linear: bool = True,
+):
     df = pd.read_csv(csv_path)
 
     if "gps_lat" not in df.columns or "gps_long" not in df.columns:
@@ -112,27 +120,34 @@ def load_client_arrays(csv_path: str):
         raise ValueError(f"Missing power columns in {csv_path}: {missing_cols}")
 
     x = df[["gps_lat", "gps_long"]].values.astype(np.float32)
-    y_vec = df[PWR_COLS].values.astype(np.float32)
+    y_linear = df[PWR_COLS].values.astype(np.float32)
 
     if "power_sum" in df.columns:
         power_sum = df["power_sum"].values.astype(np.float32)
     else:
-        power_sum = np.sum(y_vec, axis=1).astype(np.float32)
+        power_sum = np.sum(y_linear, axis=1).astype(np.float32)
 
-    eps = 1e-12
-    y_db = 10 * np.log10(y_vec + eps)
-    mean_db = np.mean(y_db)
-    std_db = np.std(y_db)
+    if assume_powers_are_linear:
+        eps = 1e-12
+        y_db = 10.0 * np.log10(np.clip(y_linear, eps, None)).astype(np.float32)
+    else:
+        raise ValueError(
+            "This script currently assumes pwr_* columns are linear powers. "
+            "If your columns are already in dB, remove the log conversion."
+        )
 
-    y_db = (y_db - mean_db) / std_db
-    y_label = np.argmax(y_db, axis=1).astype(np.int64)
+    if target_mean is not None and target_std is not None:
+        y_db = ((y_db - target_mean) / max(target_std, 1e-8)).astype(np.float32)
+
+    y_norm_linear = y_linear / (power_sum[:, None] + 1e-8)
+    y_label = np.argmax(y_linear, axis=1).astype(np.int64)
 
     if "client_id" in df.columns:
         client_ids = df["client_id"].astype(str).tolist()
     else:
         client_ids = [os.path.basename(csv_path)] * len(df)
 
-    return x, y_label, y_db, power_sum, client_ids
+    return x, y_label, y_db, y_norm_linear, y_linear, power_sum, client_ids
 
 
 def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndarray]:
@@ -158,13 +173,36 @@ def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndar
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def compute_global_target_stats(train_folder: str) -> tuple[float, float]:
+    train_paths = sorted(glob.glob(os.path.join(train_folder, "*.csv")))
+    if not train_paths:
+        raise FileNotFoundError(f"No train CSV files found in {train_folder}")
+
+    total_count = 0
+    sum_y = 0.0
+    sum_y2 = 0.0
+
+    for csv_path in train_paths:
+        df = pd.read_csv(csv_path, usecols=PWR_COLS)
+        y_linear = df[PWR_COLS].values.astype(np.float32)
+        y_db = 10.0 * np.log10(np.clip(y_linear, 1e-12, None))
+        total_count += y_db.size
+        sum_y += float(y_db.sum())
+        sum_y2 += float((y_db ** 2).sum())
+
+    mean = sum_y / max(total_count, 1)
+    var = sum_y2 / max(total_count, 1) - mean ** 2
+    std = float(np.sqrt(max(var, 1e-12)))
+    return float(mean), std
+
+
 def normalize_features(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     return ((x - mean[None, :]) / np.clip(std[None, :], 1e-8, None)).astype(np.float32)
 
 
 def make_dataloader(
     x: np.ndarray,
-    y_norm: np.ndarray,
+    y_target: np.ndarray,
     y_label: np.ndarray,
     batch_size: int,
     shuffle: bool,
@@ -173,7 +211,7 @@ def make_dataloader(
 ) -> DataLoader:
     dataset = TensorDataset(
         torch.from_numpy(x),
-        torch.from_numpy(y_norm),
+        torch.from_numpy(y_target),
         torch.from_numpy(y_label),
     )
 
@@ -250,21 +288,17 @@ def compute_power_loss_db(selected_indices: list[int], true_vec_norm: np.ndarray
 
 
 def prediction_loss(
-    pred_dist: torch.Tensor,
-    target_dist: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
     loss_name: str,
 ) -> torch.Tensor:
     if loss_name == "mse":
-        return F.mse_loss(pred_dist, target_dist, reduction="mean")
+        return F.mse_loss(pred, target, reduction="mean")
 
     if loss_name == "smoothl1":
-        return F.smooth_l1_loss(pred_dist, target_dist, reduction="mean")
+        return F.smooth_l1_loss(pred, target, reduction="mean")
 
-    if loss_name == "kl":
-        log_pred = torch.log(pred_dist.clamp_min(1e-8))
-        return F.kl_div(log_pred, target_dist, reduction="batchmean")
-
-    raise ValueError(f"Unsupported loss: {loss_name}")
+    raise ValueError(f"Unsupported loss for dB regression: {loss_name}")
 
 
 class BeamClient:
@@ -279,6 +313,7 @@ class BeamClient:
         fl_method: str,
         prox_mu: float,
         local_optimizer: str,
+        grad_clip_norm: float,
     ):
         self.client_data = client_data
         self.device = device
@@ -289,6 +324,7 @@ class BeamClient:
         self.fl_method = fl_method
         self.prox_mu = prox_mu
         self.local_optimizer = local_optimizer.lower()
+        self.grad_clip_norm = grad_clip_norm
 
     def _build_local_model(self, global_model: nn.Module) -> nn.Module:
         return copy.deepcopy(global_model).to(self.device)
@@ -337,15 +373,15 @@ class BeamClient:
         total_samples = 0
 
         for _ in range(self.local_epochs):
-            for x_batch, y_dist_batch, _ in self.client_data.train_loader:
+            for x_batch, y_target_batch, _ in self.client_data.train_loader:
                 x_batch = x_batch.to(self.device, non_blocking=True)
-                y_dist_batch = y_dist_batch.to(self.device, non_blocking=True)
+                y_target_batch = y_target_batch.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with get_autocast_context(self.device, self.use_amp):
-                    _, pred_dist = model(x_batch)
-                    main_loss = prediction_loss(pred_dist, y_dist_batch, loss_name)
+                    pred = model(x_batch)
+                    main_loss = prediction_loss(pred, y_target_batch, loss_name)
 
                     if self.fl_method == "fedprox":
                         prox_loss = self._proximal_term(model, global_params)
@@ -355,6 +391,11 @@ class BeamClient:
                     loss = main_loss + prox_loss
 
                 scaler.scale(loss).backward()
+
+                if self.grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip_norm)
+
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -378,6 +419,8 @@ def build_clients(
     device: torch.device,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
+    target_mean: Optional[float],
+    target_std: Optional[float],
 ) -> list[BeamClient]:
     train_paths = sorted(glob.glob(os.path.join(args.train_folder, "*.csv")))
     if not train_paths:
@@ -385,7 +428,12 @@ def build_clients(
 
     clients = []
     for train_csv in train_paths:
-        x_train, y_train_label, y_train_norm, _, train_client_ids = load_client_arrays(train_csv)
+        x_train, y_train_label, y_train_db, _, _, _, train_client_ids = load_client_arrays(
+            train_csv,
+            target_mean=target_mean,
+            target_std=target_std,
+            assume_powers_are_linear=True,
+        )
 
         if args.standardize_x:
             x_train = normalize_features(x_train, x_mean, x_std)
@@ -394,7 +442,7 @@ def build_clients(
 
         train_loader = make_dataloader(
             x_train,
-            y_train_norm,
+            y_train_db,
             y_train_label,
             batch_size=args.batch_size,
             shuffle=True,
@@ -408,18 +456,20 @@ def build_clients(
             num_samples=len(y_train_label),
         )
 
-        client = BeamClient(
-            client_data=client_data,
-            device=device,
-            lr=args.lr,
-            decay_l2=args.decay_l2,
-            local_epochs=args.local_epochs,
-            use_amp=args.use_amp,
-            fl_method=args.fl_method,
-            prox_mu=args.prox_mu,
-            local_optimizer=args.local_optimizer,
+        clients.append(
+            BeamClient(
+                client_data=client_data,
+                device=device,
+                lr=args.lr,
+                decay_l2=args.decay_l2,
+                local_epochs=args.local_epochs,
+                use_amp=args.use_amp,
+                fl_method=args.fl_method,
+                prox_mu=args.prox_mu,
+                local_optimizer=args.local_optimizer,
+                grad_clip_norm=args.grad_clip_norm,
+            )
         )
-        clients.append(client)
 
     return clients
 
@@ -429,29 +479,46 @@ def load_all_test_data(
     standardize_x: bool,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
+    target_mean: Optional[float],
+    target_std: Optional[float],
 ) -> TestDatasetBundle:
     test_paths = sorted(glob.glob(os.path.join(test_folder, "*.csv")))
     if not test_paths:
         raise FileNotFoundError(f"No test CSV files found in {test_folder}")
 
-    xs, ys_label, y_norms, power_sums, client_ids = [], [], [], [], []
+    xs = []
+    ys_label = []
+    ys_db = []
+    ys_norm_linear = []
+    ys_linear = []
+    power_sums = []
+    client_ids = []
 
     for test_csv in test_paths:
-        x_test, y_test_label, y_test_norm, ps_test, ids_test = load_client_arrays(test_csv)
+        x_test, y_test_label, y_test_db, y_test_norm_linear, y_test_linear, ps_test, ids_test = load_client_arrays(
+            test_csv,
+            target_mean=target_mean,
+            target_std=target_std,
+            assume_powers_are_linear=True,
+        )
 
         if standardize_x:
             x_test = normalize_features(x_test, x_mean, x_std)
 
         xs.append(x_test)
         ys_label.append(y_test_label)
-        y_norms.append(y_test_norm)
+        ys_db.append(y_test_db)
+        ys_norm_linear.append(y_test_norm_linear)
+        ys_linear.append(y_test_linear)
         power_sums.append(ps_test)
         client_ids.extend(ids_test)
 
     return TestDatasetBundle(
         x_test=np.vstack(xs),
         y_test_label=np.concatenate(ys_label),
-        y_test_norm=np.vstack(y_norms),
+        y_test_db=np.vstack(ys_db),
+        y_test_norm_linear=np.vstack(ys_norm_linear),
+        y_test_linear=np.vstack(ys_linear),
         power_sums=np.concatenate(power_sums),
         client_ids=client_ids,
     )
@@ -510,13 +577,15 @@ def evaluate_and_save(
     device: torch.device,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
+    target_mean: Optional[float],
+    target_std: Optional[float],
 ) -> None:
     global_model.eval()
     global_model.to(device)
 
     test_loader = make_dataloader(
         test_bundle.x_test,
-        test_bundle.y_test_norm,
+        test_bundle.y_test_db,
         test_bundle.y_test_label,
         batch_size=args.batch_size,
         shuffle=False,
@@ -534,10 +603,10 @@ def evaluate_and_save(
             x_batch = x_batch.to(device, non_blocking=True)
 
             with get_autocast_context(device, args.use_amp and device.type == "cuda"):
-                _, pred_dist = global_model(x_batch)
+                pred = global_model(x_batch)
 
-            pred_dist_np = pred_dist.float().cpu().numpy()
-            topk_indices = np.argsort(-pred_dist_np, axis=1)[:, :max_top_k]
+            pred_np = pred.float().cpu().numpy()
+            topk_indices = np.argsort(-pred_np, axis=1)[:, :max_top_k]
             y_true_batch = y_label_batch.numpy()
 
             for i in range(batch_size):
@@ -548,7 +617,7 @@ def evaluate_and_save(
 
                 power_loss_db = compute_power_loss_db(
                     selected_for_power,
-                    test_bundle.y_test_norm[global_idx],
+                    test_bundle.y_test_norm_linear[global_idx],
                     float(test_bundle.power_sums[global_idx]),
                 )
 
@@ -557,9 +626,7 @@ def evaluate_and_save(
                     "selected_indices_topk": json.dumps(selected_topk),
                     "true_best": true_best,
                     "predicted_best": int(selected_topk[0]),
-                    "best_power": float(
-                        test_bundle.y_test_norm[global_idx, true_best] * test_bundle.power_sums[global_idx]
-                    ),
+                    "best_power": float(test_bundle.y_test_linear[global_idx, true_best]),
                     f"power_loss_db_top{args.power_loss_k}": power_loss_db,
                 }
 
@@ -584,6 +651,7 @@ def evaluate_and_save(
         "prox_mu": float(args.prox_mu),
         "local_optimizer": args.local_optimizer,
         "standardize_x": bool(args.standardize_x),
+        "standardize_target_db": bool(args.standardize_target_db),
         "power_loss_k": int(args.power_loss_k),
     }
 
@@ -603,6 +671,10 @@ def evaluate_and_save(
         run_config["x_mean"] = [float(v) for v in x_mean]
     if x_std is not None:
         run_config["x_std"] = [float(v) for v in x_std]
+    if target_mean is not None:
+        run_config["target_mean_db"] = float(target_mean)
+    if target_std is not None:
+        run_config["target_std_db"] = float(target_std)
 
     config_path = os.path.join(args.output_dir, "run_config.json")
     with open(config_path, "w", encoding="utf-8") as f:
@@ -624,35 +696,37 @@ def evaluate_and_save(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Federated regression of full normalized beam vector (FedAvg / FedProx)"
+        description="Federated regression of full 64-beam vector in dB scale (FedAvg / FedProx)"
     )
 
     parser.add_argument("--train_folder", type=str, default="deepSense/train_sequences_scen1")
     parser.add_argument("--test_folder", type=str, default="deepSense/test_sequences_scen1")
-    parser.add_argument("--output_dir", type=str, default="results_regression")
+    parser.add_argument("--output_dir", type=str, default="results_regression_db")
 
     parser.add_argument("--nodes_per_layer", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=7)
+    parser.add_argument("--layers", type=int, default=5)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--decay_l2", type=float, default=1e-5)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
     parser.add_argument("--rounds", type=int, default=150)
-    parser.add_argument("--local_epochs", type=int, default=5)
+    parser.add_argument("--local_epochs", type=int, default=3)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
     parser.add_argument("--fl_method", type=str, default="fedprox", choices=["fedavg", "fedprox"])
-    parser.add_argument("--prox_mu", type=float, default=1e-3)
+    parser.add_argument("--prox_mu", type=float, default=1e-4)
 
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1", "kl"])
+    parser.add_argument("--loss", type=str, default="smoothl1", choices=["mse", "smoothl1"])
     parser.add_argument("--local_optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
 
     parser.add_argument("--max_top_k", type=int, default=10)
     parser.add_argument("--power_loss_k", type=int, default=10)
 
     parser.add_argument("--standardize_x", action="store_true")
+    parser.add_argument("--standardize_target_db", action="store_true")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -691,6 +765,13 @@ def main() -> None:
         x_mean, x_std = None, None
         print("Feature standardization disabled")
 
+    if args.standardize_target_db:
+        target_mean, target_std = compute_global_target_stats(args.train_folder)
+        print(f"Target dB standardization enabled | mean={target_mean:.4f} | std={target_std:.4f}")
+    else:
+        target_mean, target_std = None, None
+        print("Target dB standardization disabled")
+
     global_model = BeamRegressor(
         num_features=2,
         num_outputs=NUM_CLASSES,
@@ -699,7 +780,7 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
 
-    clients = build_clients(args, device, x_mean, x_std)
+    clients = build_clients(args, device, x_mean, x_std, target_mean, target_std)
     print(f"Built {len(clients)} training clients")
 
     test_bundle = load_all_test_data(
@@ -707,11 +788,13 @@ def main() -> None:
         standardize_x=args.standardize_x,
         x_mean=x_mean,
         x_std=x_std,
+        target_mean=target_mean,
+        target_std=target_std,
     )
     print(f"Loaded {len(test_bundle.y_test_label)} test samples from {args.test_folder}")
 
     global_model = federated_train(args, clients, global_model)
-    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std)
+    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std, target_mean, target_std)
 
 
 if __name__ == "__main__":
