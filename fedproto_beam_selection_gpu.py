@@ -72,11 +72,10 @@ class BeamRegressor(nn.Module):
         self.backbone = nn.Sequential(*layers)
         self.head = nn.Linear(in_dim, num_outputs)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x):
         features = self.backbone(x)
-        logits = self.head(features)
-        pred_dist = torch.softmax(logits, dim=1)
-        return logits, pred_dist
+        outputs = self.head(features)
+        return outputs
 
 
 @dataclass
@@ -120,15 +119,20 @@ def load_client_arrays(csv_path: str):
     else:
         power_sum = np.sum(y_vec, axis=1).astype(np.float32)
 
-    y_norm = y_vec / (power_sum[:, None] + 1e-8)
-    y_label = np.argmax(y_norm, axis=1).astype(np.int64)
+    eps = 1e-12
+    y_db = 10 * np.log10(y_vec + eps)
+    mean_db = np.mean(y_db)
+    std_db = np.std(y_db)
+
+    y_db = (y_db - mean_db) / std_db
+    y_label = np.argmax(y_db, axis=1).astype(np.int64)
 
     if "client_id" in df.columns:
         client_ids = df["client_id"].astype(str).tolist()
     else:
         client_ids = [os.path.basename(csv_path)] * len(df)
 
-    return x, y_label, y_norm, power_sum, client_ids
+    return x, y_label, y_db, power_sum, client_ids
 
 
 def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndarray]:
