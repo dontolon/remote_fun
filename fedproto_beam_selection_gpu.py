@@ -43,10 +43,6 @@ def get_autocast_context(device: torch.device, use_amp: bool):
 
 
 class BeamRegressor(nn.Module):
-    """
-    MLP that predicts the full 64-dimensional beam power vector in dB scale.
-    """
-
     def __init__(
         self,
         num_features: int,
@@ -72,9 +68,8 @@ class BeamRegressor(nn.Module):
         self.head = nn.Linear(in_dim, num_outputs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)
-        outputs = self.head(features)
-        return outputs
+        x = self.backbone(x)
+        return self.head(x)
 
 
 @dataclass
@@ -131,10 +126,7 @@ def load_client_arrays(
         eps = 1e-12
         y_db = 10.0 * np.log10(np.clip(y_linear, eps, None)).astype(np.float32)
     else:
-        raise ValueError(
-            "This script currently assumes pwr_* columns are linear powers. "
-            "If your columns are already in dB, remove the log conversion."
-        )
+        raise ValueError("This script assumes pwr_* columns are linear powers.")
 
     if target_mean is not None and target_std is not None:
         y_db = ((y_db - target_mean) / max(target_std, 1e-8)).astype(np.float32)
@@ -169,7 +161,6 @@ def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndar
     mean = sum_x / max(total_count, 1)
     var = sum_x2 / max(total_count, 1) - mean ** 2
     std = np.sqrt(np.maximum(var, 1e-12))
-
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -215,15 +206,13 @@ def make_dataloader(
         torch.from_numpy(y_label),
     )
 
-    persistent_workers = bool(num_workers > 0)
-
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        persistent_workers=(num_workers > 0),
         drop_last=False,
     )
 
@@ -287,18 +276,32 @@ def compute_power_loss_db(selected_indices: list[int], true_vec_norm: np.ndarray
     return float(10.0 * np.log10((true_max - noise) / (measured_power - noise)))
 
 
-def prediction_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    loss_name: str,
-) -> torch.Tensor:
+def prediction_loss(pred: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
     if loss_name == "mse":
         return F.mse_loss(pred, target, reduction="mean")
-
     if loss_name == "smoothl1":
         return F.smooth_l1_loss(pred, target, reduction="mean")
+    raise ValueError(f"Unsupported loss: {loss_name}")
 
-    raise ValueError(f"Unsupported loss for dB regression: {loss_name}")
+
+def clone_state_dict(state_dict: dict[str, torch.Tensor], device: Optional[torch.device] = None) -> dict[str, torch.Tensor]:
+    out = {}
+    for k, v in state_dict.items():
+        t = v.detach().clone()
+        if device is not None:
+            t = t.to(device)
+        out[k] = t
+    return out
+
+
+def init_control_variates_from_model(model: nn.Module, device: Optional[torch.device] = None) -> dict[str, torch.Tensor]:
+    ctrl = {}
+    for name, param in model.state_dict().items():
+        t = torch.zeros_like(param, dtype=torch.float32)
+        if device is not None:
+            t = t.to(device)
+        ctrl[name] = t
+    return ctrl
 
 
 class BeamClient:
@@ -311,8 +314,6 @@ class BeamClient:
         local_epochs: int,
         use_amp: bool,
         fl_method: str,
-        prox_mu: float,
-        local_optimizer: str,
         grad_clip_norm: float,
     ):
         self.client_data = client_data
@@ -322,35 +323,23 @@ class BeamClient:
         self.local_epochs = local_epochs
         self.use_amp = use_amp and device.type == "cuda"
         self.fl_method = fl_method
-        self.prox_mu = prox_mu
-        self.local_optimizer = local_optimizer.lower()
         self.grad_clip_norm = grad_clip_norm
+        self.c_local = None
 
     def _build_local_model(self, global_model: nn.Module) -> nn.Module:
         return copy.deepcopy(global_model).to(self.device)
 
     def _make_optimizer(self, model: nn.Module):
-        if self.local_optimizer == "adam":
-            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
-        if self.local_optimizer == "adamw":
-            return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
-        if self.local_optimizer == "sgd":
-            return optim.SGD(model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.decay_l2)
-        raise ValueError(f"Unsupported optimizer: {self.local_optimizer}")
+        return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
 
-    def _proximal_term(
-        self,
-        local_model: nn.Module,
-        global_params: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        prox = torch.zeros((), device=self.device)
-        for name, param in local_model.named_parameters():
-            prox = prox + torch.sum((param - global_params[name]) ** 2)
-        return 0.5 * self.prox_mu * prox
+    def _count_local_steps(self) -> int:
+        num_batches = len(self.client_data.train_loader)
+        return self.local_epochs * num_batches
 
     def local_train(
         self,
         global_model: nn.Module,
+        global_control: Optional[dict[str, torch.Tensor]],
         loss_name: str,
     ) -> dict:
         model = self._build_local_model(global_model)
@@ -359,18 +348,18 @@ class BeamClient:
         optimizer = self._make_optimizer(model)
         scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
-        if self.fl_method == "fedprox":
-            global_params = {
-                name: param.detach().clone().to(self.device)
-                for name, param in global_model.named_parameters()
-            }
+        global_state = clone_state_dict(global_model.state_dict(), device=self.device)
+
+        if self.fl_method == "scaffold":
+            if self.c_local is None:
+                self.c_local = init_control_variates_from_model(global_model, device=self.device)
+            c_global = clone_state_dict(global_control, device=self.device)
         else:
-            global_params = None
+            c_global = None
 
         total_loss = 0.0
-        total_main_loss = 0.0
-        total_prox_loss = 0.0
         total_samples = 0
+        total_steps = 0
 
         for _ in range(self.local_epochs):
             for x_batch, y_target_batch, _ in self.client_data.train_loader:
@@ -381,16 +370,17 @@ class BeamClient:
 
                 with get_autocast_context(self.device, self.use_amp):
                     pred = model(x_batch)
-                    main_loss = prediction_loss(pred, y_target_batch, loss_name)
-
-                    if self.fl_method == "fedprox":
-                        prox_loss = self._proximal_term(model, global_params)
-                    else:
-                        prox_loss = torch.zeros((), device=self.device)
-
-                    loss = main_loss + prox_loss
+                    loss = prediction_loss(pred, y_target_batch, loss_name)
 
                 scaler.scale(loss).backward()
+
+                if self.fl_method == "scaffold":
+                    scaler.unscale_(optimizer)
+                    with torch.no_grad():
+                        for name, param in model.named_parameters():
+                            if param.grad is None:
+                                continue
+                            param.grad.add_(self.c_local[name] - c_global[name])
 
                 if self.grad_clip_norm > 0:
                     scaler.unscale_(optimizer)
@@ -401,17 +391,44 @@ class BeamClient:
 
                 batch_size = x_batch.size(0)
                 total_loss += float(loss.detach().item()) * batch_size
-                total_main_loss += float(main_loss.detach().item()) * batch_size
-                total_prox_loss += float(prox_loss.detach().item()) * batch_size
                 total_samples += batch_size
+                total_steps += 1
 
-        return {
-            "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        local_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        result = {
+            "state_dict": local_state,
             "loss": total_loss / max(total_samples, 1),
-            "main_loss": total_main_loss / max(total_samples, 1),
-            "prox_loss": total_prox_loss / max(total_samples, 1),
             "num_samples": self.client_data.num_samples,
         }
+
+        if self.fl_method == "scaffold":
+            if total_steps == 0:
+                raise ValueError("SCAFFOLD requires at least one local optimization step")
+
+            model_state_device = model.state_dict()
+            c_local_new = {}
+
+            with torch.no_grad():
+                for name in model_state_device.keys():
+                    if not torch.is_floating_point(model_state_device[name]):
+                        c_local_new[name] = self.c_local[name].detach().clone()
+                        continue
+
+                    delta_model = global_state[name] - model_state_device[name]
+                    c_local_new[name] = self.c_local[name] - c_global[name] + (delta_model / (total_steps * self.lr))
+
+            c_delta = {}
+            for name in c_local_new.keys():
+                if torch.is_floating_point(c_local_new[name]):
+                    c_delta[name] = (c_local_new[name] - self.c_local[name]).detach().cpu().clone()
+                else:
+                    c_delta[name] = torch.zeros_like(c_local_new[name]).detach().cpu().clone()
+
+            self.c_local = {k: v.detach().clone() for k, v in c_local_new.items()}
+            result["c_delta"] = c_delta
+
+        return result
 
 
 def build_clients(
@@ -465,8 +482,6 @@ def build_clients(
                 local_epochs=args.local_epochs,
                 use_amp=args.use_amp,
                 fl_method=args.fl_method,
-                prox_mu=args.prox_mu,
-                local_optimizer=args.local_optimizer,
                 grad_clip_norm=args.grad_clip_norm,
             )
         )
@@ -524,11 +539,36 @@ def load_all_test_data(
     )
 
 
+def update_global_control(
+    c_global: dict[str, torch.Tensor],
+    client_c_deltas: list[dict[str, torch.Tensor]],
+    selected_clients_count: int,
+) -> dict[str, torch.Tensor]:
+    if not client_c_deltas:
+        return c_global
+
+    new_c_global = {}
+    for name in c_global.keys():
+        if not torch.is_floating_point(c_global[name]):
+            new_c_global[name] = c_global[name]
+            continue
+
+        avg_delta = sum(delta[name].float() for delta in client_c_deltas) / float(selected_clients_count)
+        new_c_global[name] = c_global[name] + avg_delta
+
+    return new_c_global
+
+
 def federated_train(
     args: argparse.Namespace,
     clients: list[BeamClient],
     global_model: nn.Module,
-) -> nn.Module:
+) -> tuple[nn.Module, Optional[dict[str, torch.Tensor]]]:
+    if args.fl_method == "scaffold":
+        c_global = init_control_variates_from_model(global_model, device="cpu")
+    else:
+        c_global = None
+
     for round_idx in range(1, args.rounds + 1):
         selected_clients = select_participating_clients(
             num_clients=len(clients),
@@ -540,34 +580,40 @@ def federated_train(
         local_state_dicts = []
         local_num_samples = []
         round_losses = []
-        round_main_losses = []
-        round_prox_losses = []
+        client_c_deltas = []
 
         for client_idx in selected_clients:
             result = clients[client_idx].local_train(
                 global_model=global_model,
+                global_control=c_global,
                 loss_name=args.loss,
             )
 
             local_state_dicts.append(result["state_dict"])
             local_num_samples.append(result["num_samples"])
             round_losses.append(result["loss"])
-            round_main_losses.append(result["main_loss"])
-            round_prox_losses.append(result["prox_loss"])
+
+            if args.fl_method == "scaffold":
+                client_c_deltas.append(result["c_delta"])
 
         new_global_state = weighted_average_state_dicts(local_state_dicts, local_num_samples)
         global_model.load_state_dict(new_global_state, strict=True)
+
+        if args.fl_method == "scaffold":
+            c_global = update_global_control(
+                c_global=c_global,
+                client_c_deltas=client_c_deltas,
+                selected_clients_count=len(selected_clients),
+            )
 
         print(
             f"Round {round_idx:03d}/{args.rounds} | "
             f"method={args.fl_method} | "
             f"clients={len(selected_clients)} | "
-            f"loss={weighted_mean(round_losses, local_num_samples):.6f} | "
-            f"main={weighted_mean(round_main_losses, local_num_samples):.6f} | "
-            f"prox={weighted_mean(round_prox_losses, local_num_samples):.6f}"
+            f"loss={weighted_mean(round_losses, local_num_samples):.6f}"
         )
 
-    return global_model
+    return global_model, c_global
 
 
 def evaluate_and_save(
@@ -594,8 +640,8 @@ def evaluate_and_save(
     )
 
     metrics_rows = []
-    max_top_k = args.max_top_k
     sample_offset = 0
+    max_top_k = args.max_top_k
 
     with torch.no_grad():
         for x_batch, _, y_label_batch in test_loader:
@@ -612,7 +658,7 @@ def evaluate_and_save(
             for i in range(batch_size):
                 global_idx = sample_offset + i
                 selected_topk = topk_indices[i].tolist()
-                selected_for_power = selected_topk[: args.power_loss_k]
+                selected_for_power = selected_topk[:args.power_loss_k]
                 true_best = int(y_true_batch[i])
 
                 power_loss_db = compute_power_loss_db(
@@ -648,11 +694,10 @@ def evaluate_and_save(
         "num_train_clients": int(len(glob.glob(os.path.join(args.train_folder, "*.csv")))),
         "fl_method": args.fl_method,
         "loss": args.loss,
-        "prox_mu": float(args.prox_mu),
-        "local_optimizer": args.local_optimizer,
         "standardize_x": bool(args.standardize_x),
         "standardize_target_db": bool(args.standardize_target_db),
         "power_loss_k": int(args.power_loss_k),
+        "optimizer": "adamw",
     }
 
     for k in range(1, max_top_k + 1):
@@ -696,7 +741,7 @@ def evaluate_and_save(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Federated regression of full 64-beam vector in dB scale (FedAvg / FedProx)"
+        description="Federated regression of full 64-beam vector in dB scale (FedAvg / SCAFFOLD)"
     )
 
     parser.add_argument("--train_folder", type=str, default="deepSense/train_sequences_scen1")
@@ -716,11 +761,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_epochs", type=int, default=3)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
-    parser.add_argument("--fl_method", type=str, default="fedprox", choices=["fedavg", "fedprox"])
-    parser.add_argument("--prox_mu", type=float, default=1e-4)
-
+    parser.add_argument("--fl_method", type=str, default="scaffold", choices=["fedavg", "scaffold"])
     parser.add_argument("--loss", type=str, default="smoothl1", choices=["mse", "smoothl1"])
-    parser.add_argument("--local_optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
 
     parser.add_argument("--max_top_k", type=int, default=10)
     parser.add_argument("--power_loss_k", type=int, default=10)
@@ -757,6 +799,7 @@ def main() -> None:
     print(f"Test folder:  {args.test_folder}")
     print(f"Federated method: {args.fl_method}")
     print(f"Loss: {args.loss}")
+    print("Local optimizer: adamw")
 
     if args.standardize_x:
         x_mean, x_std = compute_global_feature_stats(args.train_folder)
@@ -793,8 +836,18 @@ def main() -> None:
     )
     print(f"Loaded {len(test_bundle.y_test_label)} test samples from {args.test_folder}")
 
-    global_model = federated_train(args, clients, global_model)
-    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std, target_mean, target_std)
+    global_model, _ = federated_train(args, clients, global_model)
+
+    evaluate_and_save(
+        args=args,
+        global_model=global_model,
+        test_bundle=test_bundle,
+        device=device,
+        x_mean=x_mean,
+        x_std=x_std,
+        target_mean=target_mean,
+        target_std=target_std,
+    )
 
 
 if __name__ == "__main__":
