@@ -7,7 +7,7 @@ import argparse
 from dataclasses import dataclass
 from contextlib import nullcontext
 from typing import Optional
-
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -628,6 +628,8 @@ def evaluate_and_save(
 ) -> None:
     global_model.eval()
     global_model.to(device)
+    total_inference_time = 0.0
+    total_samples = 0
 
     test_loader = make_dataloader(
         test_bundle.x_test,
@@ -647,9 +649,19 @@ def evaluate_and_save(
         for x_batch, _, y_label_batch in test_loader:
             batch_size = x_batch.size(0)
             x_batch = x_batch.to(device, non_blocking=True)
+            start_time = time.perf_counter()
 
             with get_autocast_context(device, args.use_amp and device.type == "cuda"):
                 pred = global_model(x_batch)
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()  # ensure accurate timing
+
+            end_time = time.perf_counter()
+
+            batch_time = end_time - start_time
+            total_inference_time += batch_time
+            total_samples += x_batch.size(0)
 
             pred_np = pred.float().cpu().numpy()
             topk_indices = np.argsort(-pred_np, axis=1)[:, :max_top_k]
@@ -699,6 +711,7 @@ def evaluate_and_save(
         "power_loss_k": int(args.power_loss_k),
         "optimizer": "adamw",
     }
+    
 
     for k in range(1, max_top_k + 1):
         summary[f"top_{k}_accuracy"] = float(metrics_df[f"hit@{k}"].mean())
@@ -737,7 +750,11 @@ def evaluate_and_save(
     for k in range(1, max_top_k + 1):
         print(f"Top-{k} accuracy: {summary[f'top_{k}_accuracy']:.4f}")
     print(f"Mean power loss (top {args.power_loss_k}): {summary[f'mean_power_loss_db_top{args.power_loss_k}']:.4f} dB")
+    avg_time_per_sample = total_inference_time / max(total_samples, 1)
 
+    print("\nInference timing:")
+    print(f"Total inference time: {total_inference_time:.6f} s")
+    print(f"Average time per sample: {avg_time_per_sample:.8f} s")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
