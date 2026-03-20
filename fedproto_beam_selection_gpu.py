@@ -748,8 +748,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_folder", type=str, default="deepSense/test_sequences_scen1")
     parser.add_argument("--output_dir", type=str, default="results_regression_db")
 
-    parser.add_argument("--nodes_per_layer", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=5)
+    parser.add_argument("--nodes_per_layer", type=int, default=256)
+    parser.add_argument("--layers", type=int, default=7)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--batch_size", type=int, default=256)
@@ -758,11 +758,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
     parser.add_argument("--rounds", type=int, default=150)
-    parser.add_argument("--local_epochs", type=int, default=3)
+    parser.add_argument("--local_epochs", type=int, default=5)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
     parser.add_argument("--fl_method", type=str, default="scaffold", choices=["fedavg", "scaffold"])
-    parser.add_argument("--loss", type=str, default="smoothl1", choices=["mse", "smoothl1"])
+    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1"])
 
     parser.add_argument("--max_top_k", type=int, default=10)
     parser.add_argument("--power_loss_k", type=int, default=10)
@@ -771,7 +771,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--standardize_target_db", action="store_true")
 
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
 
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
