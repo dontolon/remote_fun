@@ -284,7 +284,32 @@ def prediction_loss(pred: torch.Tensor, target: torch.Tensor, loss_name: str) ->
     raise ValueError(f"Unsupported loss: {loss_name}")
 
 
-def clone_state_dict(state_dict: dict[str, torch.Tensor], device: Optional[torch.device] = None) -> dict[str, torch.Tensor]:
+def fedprox_penalty(
+    model: nn.Module,
+    global_params: dict[str, torch.Tensor],
+    mu: float,
+) -> torch.Tensor:
+    """
+    FedProx proximal term: (mu/2) * ||w - w_global||^2
+
+    This penalises local updates that drift too far from the global model,
+    which is the core contribution of FedProx for non-IID data.
+    Only floating-point parameters are included; buffers (e.g. BatchNorm
+    running stats) are intentionally excluded because they are not optimised.
+    """
+    penalty = torch.tensor(0.0, device=next(model.parameters()).device)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        global_param = global_params[name]
+        penalty = penalty + torch.sum((param - global_param) ** 2)
+    return (mu / 2.0) * penalty
+
+
+def clone_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> dict[str, torch.Tensor]:
     out = {}
     for k, v in state_dict.items():
         t = v.detach().clone()
@@ -294,7 +319,10 @@ def clone_state_dict(state_dict: dict[str, torch.Tensor], device: Optional[torch
     return out
 
 
-def init_control_variates_from_model(model: nn.Module, device: Optional[torch.device] = None) -> dict[str, torch.Tensor]:
+def init_control_variates_from_model(
+    model: nn.Module,
+    device: Optional[torch.device] = None,
+) -> dict[str, torch.Tensor]:
     ctrl = {}
     for name, param in model.state_dict().items():
         t = torch.zeros_like(param, dtype=torch.float32)
@@ -315,6 +343,8 @@ class BeamClient:
         use_amp: bool,
         fl_method: str,
         grad_clip_norm: float,
+        # FedProx-specific
+        fedprox_mu: float = 0.01,
     ):
         self.client_data = client_data
         self.device = device
@@ -324,6 +354,8 @@ class BeamClient:
         self.use_amp = use_amp and device.type == "cuda"
         self.fl_method = fl_method
         self.grad_clip_norm = grad_clip_norm
+        self.fedprox_mu = fedprox_mu
+        # SCAFFOLD control variate, initialised lazily on first round
         self.c_local = None
 
     def _build_local_model(self, global_model: nn.Module) -> nn.Module:
@@ -333,8 +365,7 @@ class BeamClient:
         return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
 
     def _count_local_steps(self) -> int:
-        num_batches = len(self.client_data.train_loader)
-        return self.local_epochs * num_batches
+        return self.local_epochs * len(self.client_data.train_loader)
 
     def local_train(
         self,
@@ -348,6 +379,7 @@ class BeamClient:
         optimizer = self._make_optimizer(model)
         scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
+        # Snapshot of global weights — needed by both FedProx and SCAFFOLD
         global_state = clone_state_dict(global_model.state_dict(), device=self.device)
 
         if self.fl_method == "scaffold":
@@ -370,10 +402,23 @@ class BeamClient:
 
                 with get_autocast_context(self.device, self.use_amp):
                     pred = model(x_batch)
-                    loss = prediction_loss(pred, y_target_batch, loss_name)
+                    task_loss = prediction_loss(pred, y_target_batch, loss_name)
+
+                    # ----------------------------------------------------------
+                    # FedProx: augment the local objective with the proximal term
+                    # so the optimiser itself sees the full penalised landscape.
+                    # This is more correct than adding a post-hoc gradient
+                    # correction, and it is compatible with AMP.
+                    # ----------------------------------------------------------
+                    if self.fl_method == "fedprox":
+                        prox = fedprox_penalty(model, global_state, self.fedprox_mu)
+                        loss = task_loss + prox
+                    else:
+                        loss = task_loss
 
                 scaler.scale(loss).backward()
 
+                # SCAFFOLD gradient correction (applied after unscaling)
                 if self.fl_method == "scaffold":
                     scaler.unscale_(optimizer)
                     with torch.no_grad():
@@ -390,7 +435,7 @@ class BeamClient:
                 scaler.update()
 
                 batch_size = x_batch.size(0)
-                total_loss += float(loss.detach().item()) * batch_size
+                total_loss += float(task_loss.detach().item()) * batch_size
                 total_samples += batch_size
                 total_steps += 1
 
@@ -398,13 +443,15 @@ class BeamClient:
 
         result = {
             "state_dict": local_state,
+            # Report task loss only (not the proximal term) for comparability
             "loss": total_loss / max(total_samples, 1),
             "num_samples": self.client_data.num_samples,
         }
 
+        # SCAFFOLD: compute and return the control-variate delta
         if self.fl_method == "scaffold":
             if total_steps == 0:
-                raise ValueError("SCAFFOLD requires at least one local optimization step")
+                raise ValueError("SCAFFOLD requires at least one local optimisation step")
 
             model_state_device = model.state_dict()
             c_local_new = {}
@@ -416,7 +463,11 @@ class BeamClient:
                         continue
 
                     delta_model = global_state[name] - model_state_device[name]
-                    c_local_new[name] = self.c_local[name] - c_global[name] + (delta_model / (total_steps * self.lr))
+                    c_local_new[name] = (
+                        self.c_local[name]
+                        - c_global[name]
+                        + (delta_model / (total_steps * self.lr))
+                    )
 
             c_delta = {}
             for name in c_local_new.keys():
@@ -455,7 +506,9 @@ def build_clients(
         if args.standardize_x:
             x_train = normalize_features(x_train, x_mean, x_std)
 
-        client_id = str(train_client_ids[0]) if len(train_client_ids) > 0 else f"client_{len(clients)}"
+        client_id = (
+            str(train_client_ids[0]) if len(train_client_ids) > 0 else f"client_{len(clients)}"
+        )
 
         train_loader = make_dataloader(
             x_train,
@@ -483,6 +536,7 @@ def build_clients(
                 use_amp=args.use_amp,
                 fl_method=args.fl_method,
                 grad_clip_norm=args.grad_clip_norm,
+                fedprox_mu=args.fedprox_mu,
             )
         )
 
@@ -501,20 +555,16 @@ def load_all_test_data(
     if not test_paths:
         raise FileNotFoundError(f"No test CSV files found in {test_folder}")
 
-    xs = []
-    ys_label = []
-    ys_db = []
-    ys_norm_linear = []
-    ys_linear = []
-    power_sums = []
-    client_ids = []
+    xs, ys_label, ys_db, ys_norm_linear, ys_linear, power_sums, client_ids = [], [], [], [], [], [], []
 
     for test_csv in test_paths:
-        x_test, y_test_label, y_test_db, y_test_norm_linear, y_test_linear, ps_test, ids_test = load_client_arrays(
-            test_csv,
-            target_mean=target_mean,
-            target_std=target_std,
-            assume_powers_are_linear=True,
+        x_test, y_test_label, y_test_db, y_test_norm_linear, y_test_linear, ps_test, ids_test = (
+            load_client_arrays(
+                test_csv,
+                target_mean=target_mean,
+                target_std=target_std,
+                assume_powers_are_linear=True,
+            )
         )
 
         if standardize_x:
@@ -552,7 +602,6 @@ def update_global_control(
         if not torch.is_floating_point(c_global[name]):
             new_c_global[name] = c_global[name]
             continue
-
         avg_delta = sum(delta[name].float() for delta in client_c_deltas) / float(selected_clients_count)
         new_c_global[name] = c_global[name] + avg_delta
 
@@ -564,10 +613,12 @@ def federated_train(
     clients: list[BeamClient],
     global_model: nn.Module,
 ) -> tuple[nn.Module, Optional[dict[str, torch.Tensor]]]:
-    if args.fl_method == "scaffold":
-        c_global = init_control_variates_from_model(global_model, device="cpu")
-    else:
-        c_global = None
+    # SCAFFOLD maintains a global control variate; FedAvg and FedProx do not
+    c_global = (
+        init_control_variates_from_model(global_model, device="cpu")
+        if args.fl_method == "scaffold"
+        else None
+    )
 
     for round_idx in range(1, args.rounds + 1):
         selected_clients = select_participating_clients(
@@ -596,6 +647,8 @@ def federated_train(
             if args.fl_method == "scaffold":
                 client_c_deltas.append(result["c_delta"])
 
+        # Aggregation is identical for FedAvg, FedProx, and SCAFFOLD:
+        # weighted average of local model parameters
         new_global_state = weighted_average_state_dicts(local_state_dicts, local_num_samples)
         global_model.load_state_dict(new_global_state, strict=True)
 
@@ -609,6 +662,7 @@ def federated_train(
         print(
             f"Round {round_idx:03d}/{args.rounds} | "
             f"method={args.fl_method} | "
+            f"mu={args.fedprox_mu if args.fl_method == 'fedprox' else 'N/A'} | "
             f"clients={len(selected_clients)} | "
             f"loss={weighted_mean(round_losses, local_num_samples):.6f}"
         )
@@ -655,12 +709,10 @@ def evaluate_and_save(
                 pred = global_model(x_batch)
 
             if device.type == "cuda":
-                torch.cuda.synchronize()  # ensure accurate timing
+                torch.cuda.synchronize()
 
             end_time = time.perf_counter()
-
-            batch_time = end_time - start_time
-            total_inference_time += batch_time
+            total_inference_time += end_time - start_time
             total_samples += x_batch.size(0)
 
             pred_np = pred.float().cpu().numpy()
@@ -670,7 +722,7 @@ def evaluate_and_save(
             for i in range(batch_size):
                 global_idx = sample_offset + i
                 selected_topk = topk_indices[i].tolist()
-                selected_for_power = selected_topk[:args.power_loss_k]
+                selected_for_power = selected_topk[: args.power_loss_k]
                 true_best = int(y_true_batch[i])
 
                 power_loss_db = compute_power_loss_db(
@@ -705,13 +757,13 @@ def evaluate_and_save(
         "num_samples": int(len(metrics_df)),
         "num_train_clients": int(len(glob.glob(os.path.join(args.train_folder, "*.csv")))),
         "fl_method": args.fl_method,
+        "fedprox_mu": float(args.fedprox_mu),
         "loss": args.loss,
         "standardize_x": bool(args.standardize_x),
         "standardize_target_db": bool(args.standardize_target_db),
         "power_loss_k": int(args.power_loss_k),
         "optimizer": "adamw",
     }
-    
 
     for k in range(1, max_top_k + 1):
         summary[f"top_{k}_accuracy"] = float(metrics_df[f"hit@{k}"].mean())
@@ -741,56 +793,91 @@ def evaluate_and_save(
     model_path = os.path.join(args.output_dir, "global_model.pt")
     torch.save(global_model.state_dict(), model_path)
 
-    print(f"\nPer-sample metrics saved to {metrics_path}")
-    print(f"Summary saved to {summary_path}")
-    print(f"Run config saved to {config_path}")
-    print(f"Global model saved to {model_path}")
+    print(f"\nPer-sample metrics  → {metrics_path}")
+    print(f"Summary             → {summary_path}")
+    print(f"Run config          → {config_path}")
+    print(f"Global model        → {model_path}")
 
     print("\nTop-k accuracy summary:")
     for k in range(1, max_top_k + 1):
-        print(f"Top-{k} accuracy: {summary[f'top_{k}_accuracy']:.4f}")
-    print(f"Mean power loss (top {args.power_loss_k}): {summary[f'mean_power_loss_db_top{args.power_loss_k}']:.4f} dB")
-    avg_time_per_sample = total_inference_time / max(total_samples, 1)
+        print(f"  Top-{k:2d}: {summary[f'top_{k}_accuracy']:.4f}")
+    print(
+        f"Mean power loss (top {args.power_loss_k}): "
+        f"{summary[f'mean_power_loss_db_top{args.power_loss_k}']:.4f} dB"
+    )
 
-    print("\nInference timing:")
-    print(f"Total inference time: {total_inference_time:.6f} s")
-    print(f"Average time per sample: {avg_time_per_sample:.8f} s")
+    avg_time = total_inference_time / max(total_samples, 1)
+    print(f"\nInference: {total_inference_time:.4f}s total | {avg_time:.8f}s per sample")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Federated regression of full 64-beam vector in dB scale (FedAvg / SCAFFOLD)"
+        description=(
+            "Federated regression of full 64-beam vector in dB scale.\n"
+            "Supports FedAvg, FedProx, and SCAFFOLD.\n\n"
+            "Typical usage:\n"
+            "  FedAvg  : --fl_method fedavg\n"
+            "  FedProx : --fl_method fedprox --fedprox_mu 0.01\n"
+            "  SCAFFOLD: --fl_method scaffold\n"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
 
+    # Data
     parser.add_argument("--train_folder", type=str, default="deepSense/train_sequences_scen1")
-    parser.add_argument("--test_folder", type=str, default="deepSense/test_sequences_scen1")
-    parser.add_argument("--output_dir", type=str, default="results_regression_db")
+    parser.add_argument("--test_folder",  type=str, default="deepSense/test_sequences_scen1")
+    parser.add_argument("--output_dir",   type=str, default="results_regression_db")
 
-    parser.add_argument("--nodes_per_layer", type=int, default=256)
-    parser.add_argument("--layers", type=int, default=7)
-    parser.add_argument("--dropout", type=float, default=0)
+    # Model
+    parser.add_argument("--nodes_per_layer", type=int,   default=256)
+    parser.add_argument("--layers",          type=int,   default=7)
+    parser.add_argument("--dropout",         type=float, default=0.1)
 
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--decay_l2", type=float, default=1e-5)
+    # Optimisation
+    parser.add_argument("--batch_size",     type=int,   default=256)
+    parser.add_argument("--lr",             type=float, default=5e-4)
+    parser.add_argument("--decay_l2",       type=float, default=1e-5)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
-    parser.add_argument("--rounds", type=int, default=150)
-    parser.add_argument("--local_epochs", type=int, default=5)
-    parser.add_argument("--fraction_fit", type=float, default=1.0)
+    # Federated
+    parser.add_argument("--rounds",        type=int,   default=150)
+    parser.add_argument("--local_epochs",  type=int,   default=5)
+    parser.add_argument("--fraction_fit",  type=float, default=1.0)
+    parser.add_argument(
+        "--fl_method",
+        type=str,
+        default="fedprox",
+        choices=["fedavg", "fedprox", "scaffold"],
+        help="Federated optimisation algorithm.",
+    )
 
-    parser.add_argument("--fl_method", type=str, default="fedavg", choices=["fedavg", "scaffold"])
+    # FedProx-specific
+    parser.add_argument(
+        "--fedprox_mu",
+        type=float,
+        default=0.01,
+        help=(
+            "Proximal penalty coefficient for FedProx (ignored by fedavg/scaffold).\n"
+            "Larger values constrain local updates more tightly to the global model.\n"
+            "Typical range: 0.001 – 1.0. Start with 0.01 and tune on validation set."
+        ),
+    )
+
+    # Loss
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1"])
 
-    parser.add_argument("--max_top_k", type=int, default=10)
+    # Evaluation
+    parser.add_argument("--max_top_k",    type=int, default=10)
     parser.add_argument("--power_loss_k", type=int, default=10)
 
-    parser.add_argument("--standardize_x", action="store_true")
+    # Normalisation
+    parser.add_argument("--standardize_x",         action="store_true")
     parser.add_argument("--standardize_target_db", action="store_true")
 
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=2)
-
-    parser.add_argument("--use_amp", action="store_true")
+    # Misc
+    parser.add_argument("--seed",          type=int, default=42)
+    parser.add_argument("--num_workers",   type=int, default=2)
+    parser.add_argument("--use_amp",       action="store_true")
     parser.add_argument("--deterministic", action="store_true")
 
     return parser.parse_args()
@@ -805,32 +892,33 @@ def main() -> None:
         raise ValueError("power_loss_k must be in [1, max_top_k]")
     if args.fraction_fit <= 0 or args.fraction_fit > 1.0:
         raise ValueError("fraction_fit must be in (0, 1]")
+    if args.fedprox_mu < 0:
+        raise ValueError("fedprox_mu must be non-negative")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     configure_torch(device, deterministic=args.deterministic)
     set_seed(args.seed)
 
-    print(f"Using device: {device}")
-    print(f"Train folder: {args.train_folder}")
-    print(f"Test folder:  {args.test_folder}")
-    print(f"Federated method: {args.fl_method}")
-    print(f"Loss: {args.loss}")
-    print("Local optimizer: adamw")
+    print(f"Device          : {device}")
+    print(f"Train folder    : {args.train_folder}")
+    print(f"Test folder     : {args.test_folder}")
+    print(f"FL method       : {args.fl_method}")
+    if args.fl_method == "fedprox":
+        print(f"FedProx mu      : {args.fedprox_mu}")
+    print(f"Loss            : {args.loss}")
+    print(f"Local optimiser : AdamW  lr={args.lr}  wd={args.decay_l2}")
 
     if args.standardize_x:
         x_mean, x_std = compute_global_feature_stats(args.train_folder)
-        print(f"Feature standardization enabled | mean={x_mean.tolist()} | std={x_std.tolist()}")
+        print(f"Feature stats   : mean={x_mean.tolist()}  std={x_std.tolist()}")
     else:
         x_mean, x_std = None, None
-        print("Feature standardization disabled")
 
     if args.standardize_target_db:
         target_mean, target_std = compute_global_target_stats(args.train_folder)
-        print(f"Target dB standardization enabled | mean={target_mean:.4f} | std={target_std:.4f}")
+        print(f"Target dB stats : mean={target_mean:.4f}  std={target_std:.4f}")
     else:
         target_mean, target_std = None, None
-        print("Target dB standardization disabled")
 
     global_model = BeamRegressor(
         num_features=2,
@@ -841,7 +929,7 @@ def main() -> None:
     ).to(device)
 
     clients = build_clients(args, device, x_mean, x_std, target_mean, target_std)
-    print(f"Built {len(clients)} training clients")
+    print(f"Clients         : {len(clients)}")
 
     test_bundle = load_all_test_data(
         test_folder=args.test_folder,
@@ -851,7 +939,7 @@ def main() -> None:
         target_mean=target_mean,
         target_std=target_std,
     )
-    print(f"Loaded {len(test_bundle.y_test_label)} test samples from {args.test_folder}")
+    print(f"Test samples    : {len(test_bundle.y_test_label)}")
 
     global_model, _ = federated_train(args, clients, global_model)
 
