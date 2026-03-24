@@ -42,14 +42,30 @@ def get_autocast_context(device: torch.device, use_amp: bool):
     return nullcontext()
 
 
-class BeamRegressor(nn.Module):
+class BeamClassifier(nn.Module):
+    """
+    Compact fully-connected classifier for 64-class beam prediction.
+
+    Architecture rationale for the non-IID federated setting:
+    - 4 layers of 128 nodes: enough capacity to learn the GPS->beam mapping
+      without over-fitting on the small, spatially localised per-client
+      datasets typical of the DeepSense6G vehicle route setup.
+    - BatchNorm after each linear layer: stabilises training across clients
+      whose local distributions differ (different routes, different traffic).
+    - Moderate dropout (0.3): regularises without collapsing gradients on
+      small local batches.
+    - No sigmoid/softmax in forward — raw logits are returned so that
+      F.cross_entropy handles the numerically stable log-softmax internally.
+    """
+
     def __init__(
         self,
-        num_features: int,
-        num_outputs: int,
-        nodes_per_layer: int,
-        n_layers: int,
-        dropout: float = 0.0,
+        num_features: int = 2,
+        num_classes: int = NUM_CLASSES,
+        nodes_per_layer: int = 128,
+        n_layers: int = 4,
+        dropout: float = 0.3,
+        use_batchnorm: bool = True,
     ):
         super().__init__()
         if n_layers < 1:
@@ -59,17 +75,28 @@ class BeamRegressor(nn.Module):
         in_dim = num_features
         for _ in range(n_layers):
             layers.append(nn.Linear(in_dim, nodes_per_layer))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(nodes_per_layer))
             layers.append(nn.ReLU())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_dim = nodes_per_layer
 
         self.backbone = nn.Sequential(*layers)
-        self.head = nn.Linear(in_dim, num_outputs)
+        self.head = nn.Linear(in_dim, num_classes)
+
+        # Kaiming initialisation — better than default for ReLU networks
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(x)
-        return self.head(x)
+        return self.head(self.backbone(x))
 
 
 @dataclass
@@ -84,7 +111,6 @@ class TestDatasetBundle:
         self,
         x_test: np.ndarray,
         y_test_label: np.ndarray,
-        y_test_db: np.ndarray,
         y_test_norm_linear: np.ndarray,
         y_test_linear: np.ndarray,
         power_sums: np.ndarray,
@@ -92,99 +118,59 @@ class TestDatasetBundle:
     ):
         self.x_test = x_test
         self.y_test_label = y_test_label
-        self.y_test_db = y_test_db
         self.y_test_norm_linear = y_test_norm_linear
         self.y_test_linear = y_test_linear
         self.power_sums = power_sums
         self.client_ids = client_ids
 
 
-def load_client_arrays(
-    csv_path: str,
-    target_mean: Optional[float] = None,
-    target_std: Optional[float] = None,
-    assume_powers_are_linear: bool = True,
-):
+def load_client_arrays(csv_path: str):
     df = pd.read_csv(csv_path)
 
-    if "gps_lat" not in df.columns or "gps_long" not in df.columns:
-        raise ValueError(f"{csv_path} must contain gps_lat and gps_long columns")
+    for col in ("gps_lat", "gps_long"):
+        if col not in df.columns:
+            raise ValueError(f"{csv_path} is missing column '{col}'")
 
-    missing_cols = [col for col in PWR_COLS if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing power columns in {csv_path}: {missing_cols}")
+    missing = [c for c in PWR_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing power columns in {csv_path}: {missing}")
 
     x = df[["gps_lat", "gps_long"]].values.astype(np.float32)
     y_linear = df[PWR_COLS].values.astype(np.float32)
 
-    if "power_sum" in df.columns:
-        power_sum = df["power_sum"].values.astype(np.float32)
-    else:
-        power_sum = np.sum(y_linear, axis=1).astype(np.float32)
-
-    if assume_powers_are_linear:
-        eps = 1e-12
-        y_db = 10.0 * np.log10(np.clip(y_linear, eps, None)).astype(np.float32)
-    else:
-        raise ValueError("This script assumes pwr_* columns are linear powers.")
-
-    if target_mean is not None and target_std is not None:
-        y_db = ((y_db - target_mean) / max(target_std, 1e-8)).astype(np.float32)
+    power_sum = (
+        df["power_sum"].values.astype(np.float32)
+        if "power_sum" in df.columns
+        else np.sum(y_linear, axis=1).astype(np.float32)
+    )
 
     y_norm_linear = y_linear / (power_sum[:, None] + 1e-8)
     y_label = np.argmax(y_linear, axis=1).astype(np.int64)
 
-    if "client_id" in df.columns:
-        client_ids = df["client_id"].astype(str).tolist()
-    else:
-        client_ids = [os.path.basename(csv_path)] * len(df)
+    client_ids = (
+        df["client_id"].astype(str).tolist()
+        if "client_id" in df.columns
+        else [os.path.basename(csv_path)] * len(df)
+    )
 
-    return x, y_label, y_db, y_norm_linear, y_linear, power_sum, client_ids
+    return x, y_label, y_norm_linear, y_linear, power_sum, client_ids
 
 
 def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndarray]:
     train_paths = sorted(glob.glob(os.path.join(train_folder, "*.csv")))
     if not train_paths:
-        raise FileNotFoundError(f"No train CSV files found in {train_folder}")
+        raise FileNotFoundError(f"No CSVs found in {train_folder}")
 
-    total_count = 0
-    sum_x = np.zeros(2, dtype=np.float64)
-    sum_x2 = np.zeros(2, dtype=np.float64)
+    total, sum_x, sum_x2 = 0, np.zeros(2, np.float64), np.zeros(2, np.float64)
+    for p in train_paths:
+        x = pd.read_csv(p, usecols=["gps_lat", "gps_long"]).values.astype(np.float64)
+        total += x.shape[0]
+        sum_x += x.sum(0)
+        sum_x2 += (x ** 2).sum(0)
 
-    for csv_path in train_paths:
-        df = pd.read_csv(csv_path, usecols=["gps_lat", "gps_long"])
-        x = df[["gps_lat", "gps_long"]].values.astype(np.float64)
-        total_count += x.shape[0]
-        sum_x += x.sum(axis=0)
-        sum_x2 += (x ** 2).sum(axis=0)
-
-    mean = sum_x / max(total_count, 1)
-    var = sum_x2 / max(total_count, 1) - mean ** 2
-    std = np.sqrt(np.maximum(var, 1e-12))
+    mean = sum_x / max(total, 1)
+    std = np.sqrt(np.maximum(sum_x2 / max(total, 1) - mean ** 2, 1e-12))
     return mean.astype(np.float32), std.astype(np.float32)
-
-
-def compute_global_target_stats(train_folder: str) -> tuple[float, float]:
-    train_paths = sorted(glob.glob(os.path.join(train_folder, "*.csv")))
-    if not train_paths:
-        raise FileNotFoundError(f"No train CSV files found in {train_folder}")
-
-    total_count = 0
-    sum_y = 0.0
-    sum_y2 = 0.0
-
-    for csv_path in train_paths:
-        df = pd.read_csv(csv_path, usecols=PWR_COLS)
-        y_linear = df[PWR_COLS].values.astype(np.float32)
-        y_db = 10.0 * np.log10(np.clip(y_linear, 1e-12, None))
-        total_count += y_db.size
-        sum_y += float(y_db.sum())
-        sum_y2 += float((y_db ** 2).sum())
-
-    mean = sum_y / max(total_count, 1)
-    var = sum_y2 / max(total_count, 1) - mean ** 2
-    std = float(np.sqrt(max(var, 1e-12)))
-    return float(mean), std
 
 
 def normalize_features(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -193,19 +179,13 @@ def normalize_features(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.n
 
 def make_dataloader(
     x: np.ndarray,
-    y_target: np.ndarray,
     y_label: np.ndarray,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
 ) -> DataLoader:
-    dataset = TensorDataset(
-        torch.from_numpy(x),
-        torch.from_numpy(y_target),
-        torch.from_numpy(y_label),
-    )
-
+    dataset = TensorDataset(torch.from_numpy(x), torch.from_numpy(y_label))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -225,10 +205,9 @@ def select_participating_clients(
 ) -> list[int]:
     if fraction_fit >= 1.0:
         return list(range(num_clients))
-
     rng = random.Random(seed + round_idx)
-    num_selected = max(1, int(np.ceil(fraction_fit * num_clients)))
-    return sorted(rng.sample(range(num_clients), num_selected))
+    k = max(1, int(np.ceil(fraction_fit * num_clients)))
+    return sorted(rng.sample(range(num_clients), k))
 
 
 def weighted_average_state_dicts(
@@ -236,52 +215,48 @@ def weighted_average_state_dicts(
     local_num_samples: list[int],
 ) -> dict[str, torch.Tensor]:
     if not local_state_dicts:
-        raise ValueError("No local state dicts provided for aggregation")
+        raise ValueError("No local state dicts provided")
 
-    total_samples = float(sum(local_num_samples))
-    avg_state = {}
-
-    for key in local_state_dicts[0].keys():
+    total = float(sum(local_num_samples))
+    avg = {}
+    for key in local_state_dicts[0]:
         weighted_sum = None
-        for state_dict, num_samples in zip(local_state_dicts, local_num_samples):
-            tensor = state_dict[key].float()
-            weight = float(num_samples) / total_samples
-            contrib = tensor * weight
+        for sd, n in zip(local_state_dicts, local_num_samples):
+            contrib = sd[key].float() * (float(n) / total)
             weighted_sum = contrib if weighted_sum is None else weighted_sum + contrib
-        avg_state[key] = weighted_sum
-
-    return avg_state
+        avg[key] = weighted_sum
+    return avg
 
 
 def weighted_mean(values: list[float], weights: list[int]) -> float:
-    if len(values) == 0:
+    if not values:
         return float("nan")
-    values_arr = np.asarray(values, dtype=np.float64)
-    weights_arr = np.asarray(weights, dtype=np.float64)
-    return float(np.sum(values_arr * weights_arr) / np.sum(weights_arr))
+    v = np.asarray(values, np.float64)
+    w = np.asarray(weights, np.float64)
+    return float(np.sum(v * w) / np.sum(w))
 
 
-def compute_power_loss_db(selected_indices: list[int], true_vec_norm: np.ndarray, power_sum: float) -> float:
-    if len(selected_indices) == 0:
+def compute_power_loss_db(
+    selected_indices: list[int],
+    true_vec_norm: np.ndarray,
+    power_sum: float,
+) -> float:
+    if not selected_indices:
         return np.nan
-
     true_vec = true_vec_norm * power_sum
     noise = np.min(true_vec) / 2.0
-    measured_power = np.max(true_vec[np.asarray(selected_indices, dtype=np.int64)])
+    measured = np.max(true_vec[np.asarray(selected_indices, np.int64)])
     true_max = np.max(true_vec)
-
-    if measured_power - noise <= 0:
+    if measured - noise <= 0:
         return np.nan
+    return float(10.0 * np.log10((true_max - noise) / (measured - noise)))
 
-    return float(10.0 * np.log10((true_max - noise) / (measured_power - noise)))
 
-
-def prediction_loss(pred: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
-    if loss_name == "mse":
-        return F.mse_loss(pred, target, reduction="mean")
-    if loss_name == "smoothl1":
-        return F.smooth_l1_loss(pred, target, reduction="mean")
-    raise ValueError(f"Unsupported loss: {loss_name}")
+def clone_state_dict(
+    sd: dict[str, torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> dict[str, torch.Tensor]:
+    return {k: (v.detach().clone().to(device) if device else v.detach().clone()) for k, v in sd.items()}
 
 
 def fedprox_penalty(
@@ -290,46 +265,16 @@ def fedprox_penalty(
     mu: float,
 ) -> torch.Tensor:
     """
-    FedProx proximal term: (mu/2) * ||w - w_global||^2
+    (mu/2) * sum_i ||w_i - w_global_i||^2  over all trainable parameters.
 
-    This penalises local updates that drift too far from the global model,
-    which is the core contribution of FedProx for non-IID data.
-    Only floating-point parameters are included; buffers (e.g. BatchNorm
-    running stats) are intentionally excluded because they are not optimised.
+    Included in the loss *before* backward so the optimiser sees the full
+    penalised landscape — more correct than a post-hoc gradient correction.
     """
     penalty = torch.tensor(0.0, device=next(model.parameters()).device)
     for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        global_param = global_params[name]
-        penalty = penalty + torch.sum((param - global_param) ** 2)
+        if param.requires_grad:
+            penalty = penalty + torch.sum((param - global_params[name]) ** 2)
     return (mu / 2.0) * penalty
-
-
-def clone_state_dict(
-    state_dict: dict[str, torch.Tensor],
-    device: Optional[torch.device] = None,
-) -> dict[str, torch.Tensor]:
-    out = {}
-    for k, v in state_dict.items():
-        t = v.detach().clone()
-        if device is not None:
-            t = t.to(device)
-        out[k] = t
-    return out
-
-
-def init_control_variates_from_model(
-    model: nn.Module,
-    device: Optional[torch.device] = None,
-) -> dict[str, torch.Tensor]:
-    ctrl = {}
-    for name, param in model.state_dict().items():
-        t = torch.zeros_like(param, dtype=torch.float32)
-        if device is not None:
-            t = t.to(device)
-        ctrl[name] = t
-    return ctrl
 
 
 class BeamClient:
@@ -341,10 +286,9 @@ class BeamClient:
         decay_l2: float,
         local_epochs: int,
         use_amp: bool,
-        fl_method: str,
         grad_clip_norm: float,
-        # FedProx-specific
-        fedprox_mu: float = 0.01,
+        fedprox_mu: float,
+        label_smoothing: float,
     ):
         self.client_data = client_data
         self.device = device
@@ -352,80 +296,46 @@ class BeamClient:
         self.decay_l2 = decay_l2
         self.local_epochs = local_epochs
         self.use_amp = use_amp and device.type == "cuda"
-        self.fl_method = fl_method
         self.grad_clip_norm = grad_clip_norm
         self.fedprox_mu = fedprox_mu
-        # SCAFFOLD control variate, initialised lazily on first round
-        self.c_local = None
+        self.label_smoothing = label_smoothing
 
     def _build_local_model(self, global_model: nn.Module) -> nn.Module:
         return copy.deepcopy(global_model).to(self.device)
 
-    def _make_optimizer(self, model: nn.Module):
-        return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.decay_l2)
-
-    def _count_local_steps(self) -> int:
-        return self.local_epochs * len(self.client_data.train_loader)
-
-    def local_train(
-        self,
-        global_model: nn.Module,
-        global_control: Optional[dict[str, torch.Tensor]],
-        loss_name: str,
-    ) -> dict:
+    def local_train(self, global_model: nn.Module) -> dict:
         model = self._build_local_model(global_model)
         model.train()
 
-        optimizer = self._make_optimizer(model)
+        optimizer = optim.AdamW(
+            model.parameters(), lr=self.lr, weight_decay=self.decay_l2
+        )
         scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
-        # Snapshot of global weights — needed by both FedProx and SCAFFOLD
+        # Snapshot global weights for the proximal term
         global_state = clone_state_dict(global_model.state_dict(), device=self.device)
 
-        if self.fl_method == "scaffold":
-            if self.c_local is None:
-                self.c_local = init_control_variates_from_model(global_model, device=self.device)
-            c_global = clone_state_dict(global_control, device=self.device)
-        else:
-            c_global = None
+        # Cross-entropy with label smoothing — reduces overconfidence on
+        # sparse local label distributions
+        ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
 
         total_loss = 0.0
         total_samples = 0
-        total_steps = 0
 
         for _ in range(self.local_epochs):
-            for x_batch, y_target_batch, _ in self.client_data.train_loader:
+            for x_batch, y_label_batch in self.client_data.train_loader:
                 x_batch = x_batch.to(self.device, non_blocking=True)
-                y_target_batch = y_target_batch.to(self.device, non_blocking=True)
+                y_label_batch = y_label_batch.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with get_autocast_context(self.device, self.use_amp):
-                    pred = model(x_batch)
-                    task_loss = prediction_loss(pred, y_target_batch, loss_name)
-
-                    # ----------------------------------------------------------
-                    # FedProx: augment the local objective with the proximal term
-                    # so the optimiser itself sees the full penalised landscape.
-                    # This is more correct than adding a post-hoc gradient
-                    # correction, and it is compatible with AMP.
-                    # ----------------------------------------------------------
-                    if self.fl_method == "fedprox":
-                        prox = fedprox_penalty(model, global_state, self.fedprox_mu)
-                        loss = task_loss + prox
-                    else:
-                        loss = task_loss
+                    logits = model(x_batch)
+                    task_loss = ce_loss_fn(logits, y_label_batch)
+                    prox = fedprox_penalty(model, global_state, self.fedprox_mu)
+                    loss = task_loss + prox
 
                 scaler.scale(loss).backward()
-
-                # SCAFFOLD gradient correction (applied after unscaling)
-                if self.fl_method == "scaffold":
-                    scaler.unscale_(optimizer)
-                    with torch.no_grad():
-                        for name, param in model.named_parameters():
-                            if param.grad is None:
-                                continue
-                            param.grad.add_(self.c_local[name] - c_global[name])
 
                 if self.grad_clip_norm > 0:
                     scaler.unscale_(optimizer)
@@ -434,52 +344,15 @@ class BeamClient:
                 scaler.step(optimizer)
                 scaler.update()
 
-                batch_size = x_batch.size(0)
-                total_loss += float(task_loss.detach().item()) * batch_size
-                total_samples += batch_size
-                total_steps += 1
+                bs = x_batch.size(0)
+                total_loss += float(task_loss.detach().item()) * bs
+                total_samples += bs
 
-        local_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-        result = {
-            "state_dict": local_state,
-            # Report task loss only (not the proximal term) for comparability
+        return {
+            "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
             "loss": total_loss / max(total_samples, 1),
             "num_samples": self.client_data.num_samples,
         }
-
-        # SCAFFOLD: compute and return the control-variate delta
-        if self.fl_method == "scaffold":
-            if total_steps == 0:
-                raise ValueError("SCAFFOLD requires at least one local optimisation step")
-
-            model_state_device = model.state_dict()
-            c_local_new = {}
-
-            with torch.no_grad():
-                for name in model_state_device.keys():
-                    if not torch.is_floating_point(model_state_device[name]):
-                        c_local_new[name] = self.c_local[name].detach().clone()
-                        continue
-
-                    delta_model = global_state[name] - model_state_device[name]
-                    c_local_new[name] = (
-                        self.c_local[name]
-                        - c_global[name]
-                        + (delta_model / (total_steps * self.lr))
-                    )
-
-            c_delta = {}
-            for name in c_local_new.keys():
-                if torch.is_floating_point(c_local_new[name]):
-                    c_delta[name] = (c_local_new[name] - self.c_local[name]).detach().cpu().clone()
-                else:
-                    c_delta[name] = torch.zeros_like(c_local_new[name]).detach().cpu().clone()
-
-            self.c_local = {k: v.detach().clone() for k, v in c_local_new.items()}
-            result["c_delta"] = c_delta
-
-        return result
 
 
 def build_clients(
@@ -487,58 +360,39 @@ def build_clients(
     device: torch.device,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
-    target_mean: Optional[float],
-    target_std: Optional[float],
 ) -> list[BeamClient]:
     train_paths = sorted(glob.glob(os.path.join(args.train_folder, "*.csv")))
     if not train_paths:
-        raise FileNotFoundError(f"No train CSV files found in {args.train_folder}")
+        raise FileNotFoundError(f"No CSVs in {args.train_folder}")
 
     clients = []
-    for train_csv in train_paths:
-        x_train, y_train_label, y_train_db, _, _, _, train_client_ids = load_client_arrays(
-            train_csv,
-            target_mean=target_mean,
-            target_std=target_std,
-            assume_powers_are_linear=True,
-        )
+    for csv_path in train_paths:
+        x, y_label, _, _, _, cids = load_client_arrays(csv_path)
 
         if args.standardize_x:
-            x_train = normalize_features(x_train, x_mean, x_std)
+            x = normalize_features(x, x_mean, x_std)
 
-        client_id = (
-            str(train_client_ids[0]) if len(train_client_ids) > 0 else f"client_{len(clients)}"
-        )
+        client_id = cids[0] if cids else f"client_{len(clients)}"
 
-        train_loader = make_dataloader(
-            x_train,
-            y_train_db,
-            y_train_label,
+        loader = make_dataloader(
+            x, y_label,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
         )
 
-        client_data = ClientData(
-            client_id=client_id,
-            train_loader=train_loader,
-            num_samples=len(y_train_label),
-        )
-
-        clients.append(
-            BeamClient(
-                client_data=client_data,
-                device=device,
-                lr=args.lr,
-                decay_l2=args.decay_l2,
-                local_epochs=args.local_epochs,
-                use_amp=args.use_amp,
-                fl_method=args.fl_method,
-                grad_clip_norm=args.grad_clip_norm,
-                fedprox_mu=args.fedprox_mu,
-            )
-        )
+        clients.append(BeamClient(
+            client_data=ClientData(client_id=client_id, train_loader=loader, num_samples=len(y_label)),
+            device=device,
+            lr=args.lr,
+            decay_l2=args.decay_l2,
+            local_epochs=args.local_epochs,
+            use_amp=args.use_amp,
+            grad_clip_norm=args.grad_clip_norm,
+            fedprox_mu=args.fedprox_mu,
+            label_smoothing=args.label_smoothing,
+        ))
 
     return clients
 
@@ -548,126 +402,61 @@ def load_all_test_data(
     standardize_x: bool,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
-    target_mean: Optional[float],
-    target_std: Optional[float],
 ) -> TestDatasetBundle:
     test_paths = sorted(glob.glob(os.path.join(test_folder, "*.csv")))
     if not test_paths:
-        raise FileNotFoundError(f"No test CSV files found in {test_folder}")
+        raise FileNotFoundError(f"No CSVs in {test_folder}")
 
-    xs, ys_label, ys_db, ys_norm_linear, ys_linear, power_sums, client_ids = [], [], [], [], [], [], []
+    xs, ys_label, ys_norm, ys_lin, psums, cids = [], [], [], [], [], []
 
-    for test_csv in test_paths:
-        x_test, y_test_label, y_test_db, y_test_norm_linear, y_test_linear, ps_test, ids_test = (
-            load_client_arrays(
-                test_csv,
-                target_mean=target_mean,
-                target_std=target_std,
-                assume_powers_are_linear=True,
-            )
-        )
-
+    for p in test_paths:
+        x, y_label, y_norm, y_lin, ps, ids = load_client_arrays(p)
         if standardize_x:
-            x_test = normalize_features(x_test, x_mean, x_std)
-
-        xs.append(x_test)
-        ys_label.append(y_test_label)
-        ys_db.append(y_test_db)
-        ys_norm_linear.append(y_test_norm_linear)
-        ys_linear.append(y_test_linear)
-        power_sums.append(ps_test)
-        client_ids.extend(ids_test)
+            x = normalize_features(x, x_mean, x_std)
+        xs.append(x); ys_label.append(y_label)
+        ys_norm.append(y_norm); ys_lin.append(y_lin)
+        psums.append(ps); cids.extend(ids)
 
     return TestDatasetBundle(
         x_test=np.vstack(xs),
         y_test_label=np.concatenate(ys_label),
-        y_test_db=np.vstack(ys_db),
-        y_test_norm_linear=np.vstack(ys_norm_linear),
-        y_test_linear=np.vstack(ys_linear),
-        power_sums=np.concatenate(power_sums),
-        client_ids=client_ids,
+        y_test_norm_linear=np.vstack(ys_norm),
+        y_test_linear=np.vstack(ys_lin),
+        power_sums=np.concatenate(psums),
+        client_ids=cids,
     )
-
-
-def update_global_control(
-    c_global: dict[str, torch.Tensor],
-    client_c_deltas: list[dict[str, torch.Tensor]],
-    selected_clients_count: int,
-) -> dict[str, torch.Tensor]:
-    if not client_c_deltas:
-        return c_global
-
-    new_c_global = {}
-    for name in c_global.keys():
-        if not torch.is_floating_point(c_global[name]):
-            new_c_global[name] = c_global[name]
-            continue
-        avg_delta = sum(delta[name].float() for delta in client_c_deltas) / float(selected_clients_count)
-        new_c_global[name] = c_global[name] + avg_delta
-
-    return new_c_global
 
 
 def federated_train(
     args: argparse.Namespace,
     clients: list[BeamClient],
     global_model: nn.Module,
-) -> tuple[nn.Module, Optional[dict[str, torch.Tensor]]]:
-    # SCAFFOLD maintains a global control variate; FedAvg and FedProx do not
-    c_global = (
-        init_control_variates_from_model(global_model, device="cpu")
-        if args.fl_method == "scaffold"
-        else None
-    )
-
+) -> nn.Module:
     for round_idx in range(1, args.rounds + 1):
-        selected_clients = select_participating_clients(
-            num_clients=len(clients),
-            fraction_fit=args.fraction_fit,
-            seed=args.seed,
-            round_idx=round_idx,
+        selected = select_participating_clients(
+            len(clients), args.fraction_fit, args.seed, round_idx
         )
 
-        local_state_dicts = []
-        local_num_samples = []
-        round_losses = []
-        client_c_deltas = []
+        local_sds, local_ns, round_losses = [], [], []
 
-        for client_idx in selected_clients:
-            result = clients[client_idx].local_train(
-                global_model=global_model,
-                global_control=c_global,
-                loss_name=args.loss,
-            )
-
-            local_state_dicts.append(result["state_dict"])
-            local_num_samples.append(result["num_samples"])
+        for idx in selected:
+            result = clients[idx].local_train(global_model)
+            local_sds.append(result["state_dict"])
+            local_ns.append(result["num_samples"])
             round_losses.append(result["loss"])
 
-            if args.fl_method == "scaffold":
-                client_c_deltas.append(result["c_delta"])
-
-        # Aggregation is identical for FedAvg, FedProx, and SCAFFOLD:
-        # weighted average of local model parameters
-        new_global_state = weighted_average_state_dicts(local_state_dicts, local_num_samples)
-        global_model.load_state_dict(new_global_state, strict=True)
-
-        if args.fl_method == "scaffold":
-            c_global = update_global_control(
-                c_global=c_global,
-                client_c_deltas=client_c_deltas,
-                selected_clients_count=len(selected_clients),
-            )
+        global_model.load_state_dict(
+            weighted_average_state_dicts(local_sds, local_ns), strict=True
+        )
 
         print(
             f"Round {round_idx:03d}/{args.rounds} | "
-            f"method={args.fl_method} | "
-            f"mu={args.fedprox_mu if args.fl_method == 'fedprox' else 'N/A'} | "
-            f"clients={len(selected_clients)} | "
-            f"loss={weighted_mean(round_losses, local_num_samples):.6f}"
+            f"FedProx mu={args.fedprox_mu} | "
+            f"clients={len(selected)} | "
+            f"CE loss={weighted_mean(round_losses, local_ns):.6f}"
         )
 
-    return global_model, c_global
+    return global_model
 
 
 def evaluate_and_save(
@@ -677,17 +466,12 @@ def evaluate_and_save(
     device: torch.device,
     x_mean: Optional[np.ndarray],
     x_std: Optional[np.ndarray],
-    target_mean: Optional[float],
-    target_std: Optional[float],
 ) -> None:
     global_model.eval()
     global_model.to(device)
-    total_inference_time = 0.0
-    total_samples = 0
 
     test_loader = make_dataloader(
         test_bundle.x_test,
-        test_bundle.y_test_db,
         test_bundle.y_test_label,
         batch_size=args.batch_size,
         shuffle=False,
@@ -697,200 +481,150 @@ def evaluate_and_save(
 
     metrics_rows = []
     sample_offset = 0
-    max_top_k = args.max_top_k
+    total_inf_time = 0.0
+    total_samples = 0
 
     with torch.no_grad():
-        for x_batch, _, y_label_batch in test_loader:
-            batch_size = x_batch.size(0)
+        for x_batch, y_label_batch in test_loader:
+            bs = x_batch.size(0)
             x_batch = x_batch.to(device, non_blocking=True)
-            start_time = time.perf_counter()
 
+            t0 = time.perf_counter()
             with get_autocast_context(device, args.use_amp and device.type == "cuda"):
-                pred = global_model(x_batch)
-
+                logits = global_model(x_batch)
             if device.type == "cuda":
                 torch.cuda.synchronize()
+            total_inf_time += time.perf_counter() - t0
+            total_samples += bs
 
-            end_time = time.perf_counter()
-            total_inference_time += end_time - start_time
-            total_samples += x_batch.size(0)
+            topk = np.argsort(-logits.float().cpu().numpy(), axis=1)[:, : args.max_top_k]
+            y_true = y_label_batch.numpy()
 
-            pred_np = pred.float().cpu().numpy()
-            topk_indices = np.argsort(-pred_np, axis=1)[:, :max_top_k]
-            y_true_batch = y_label_batch.numpy()
-
-            for i in range(batch_size):
-                global_idx = sample_offset + i
-                selected_topk = topk_indices[i].tolist()
-                selected_for_power = selected_topk[: args.power_loss_k]
-                true_best = int(y_true_batch[i])
-
-                power_loss_db = compute_power_loss_db(
-                    selected_for_power,
-                    test_bundle.y_test_norm_linear[global_idx],
-                    float(test_bundle.power_sums[global_idx]),
-                )
+            for i in range(bs):
+                gi = sample_offset + i
+                selected_topk = topk[i].tolist()
+                true_best = int(y_true[i])
 
                 row = {
-                    "client_id": test_bundle.client_ids[global_idx],
+                    "client_id": test_bundle.client_ids[gi],
                     "selected_indices_topk": json.dumps(selected_topk),
                     "true_best": true_best,
-                    "predicted_best": int(selected_topk[0]),
-                    "best_power": float(test_bundle.y_test_linear[global_idx, true_best]),
-                    f"power_loss_db_top{args.power_loss_k}": power_loss_db,
+                    "predicted_best": selected_topk[0],
+                    "best_power": float(test_bundle.y_test_linear[gi, true_best]),
+                    f"power_loss_db_top{args.power_loss_k}": compute_power_loss_db(
+                        selected_topk[: args.power_loss_k],
+                        test_bundle.y_test_norm_linear[gi],
+                        float(test_bundle.power_sums[gi]),
+                    ),
                 }
-
-                for k in range(1, max_top_k + 1):
+                for k in range(1, args.max_top_k + 1):
                     row[f"hit@{k}"] = int(true_best in selected_topk[:k])
 
                 metrics_rows.append(row)
-
-            sample_offset += batch_size
+            sample_offset += bs
 
     metrics_df = pd.DataFrame(metrics_rows)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    metrics_path = os.path.join(args.output_dir, "metrics.csv")
-    metrics_df.to_csv(metrics_path, index=False)
+    metrics_df.to_csv(os.path.join(args.output_dir, "metrics.csv"), index=False)
 
     summary = {
+        "fl_method": "fedprox",
+        "fedprox_mu": float(args.fedprox_mu),
+        "label_smoothing": float(args.label_smoothing),
+        "nodes_per_layer": int(args.nodes_per_layer),
+        "layers": int(args.layers),
         "num_samples": int(len(metrics_df)),
         "num_train_clients": int(len(glob.glob(os.path.join(args.train_folder, "*.csv")))),
-        "fl_method": args.fl_method,
-        "fedprox_mu": float(args.fedprox_mu),
-        "loss": args.loss,
-        "standardize_x": bool(args.standardize_x),
-        "standardize_target_db": bool(args.standardize_target_db),
-        "power_loss_k": int(args.power_loss_k),
-        "optimizer": "adamw",
     }
-
-    for k in range(1, max_top_k + 1):
+    for k in range(1, args.max_top_k + 1):
         summary[f"top_{k}_accuracy"] = float(metrics_df[f"hit@{k}"].mean())
-
     summary[f"mean_power_loss_db_top{args.power_loss_k}"] = float(
         metrics_df[f"power_loss_db_top{args.power_loss_k}"].mean()
     )
 
-    summary_df = pd.DataFrame([{"metric": key, "value": value} for key, value in summary.items()])
-    summary_path = os.path.join(args.output_dir, "summary.csv")
-    summary_df.to_csv(summary_path, index=False)
-
-    run_config = vars(args).copy()
-    if x_mean is not None:
-        run_config["x_mean"] = [float(v) for v in x_mean]
-    if x_std is not None:
-        run_config["x_std"] = [float(v) for v in x_std]
-    if target_mean is not None:
-        run_config["target_mean_db"] = float(target_mean)
-    if target_std is not None:
-        run_config["target_std_db"] = float(target_std)
-
-    config_path = os.path.join(args.output_dir, "run_config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(run_config, f, indent=2)
-
-    model_path = os.path.join(args.output_dir, "global_model.pt")
-    torch.save(global_model.state_dict(), model_path)
-
-    print(f"\nPer-sample metrics  → {metrics_path}")
-    print(f"Summary             → {summary_path}")
-    print(f"Run config          → {config_path}")
-    print(f"Global model        → {model_path}")
-
-    print("\nTop-k accuracy summary:")
-    for k in range(1, max_top_k + 1):
-        print(f"  Top-{k:2d}: {summary[f'top_{k}_accuracy']:.4f}")
-    print(
-        f"Mean power loss (top {args.power_loss_k}): "
-        f"{summary[f'mean_power_loss_db_top{args.power_loss_k}']:.4f} dB"
+    pd.DataFrame([{"metric": k, "value": v} for k, v in summary.items()]).to_csv(
+        os.path.join(args.output_dir, "summary.csv"), index=False
     )
 
-    avg_time = total_inference_time / max(total_samples, 1)
-    print(f"\nInference: {total_inference_time:.4f}s total | {avg_time:.8f}s per sample")
+    run_cfg = vars(args).copy()
+    if x_mean is not None:
+        run_cfg["x_mean"] = x_mean.tolist()
+    if x_std is not None:
+        run_cfg["x_std"] = x_std.tolist()
+    with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
+        json.dump(run_cfg, f, indent=2)
+
+    torch.save(global_model.state_dict(), os.path.join(args.output_dir, "global_model.pt"))
+
+    print(f"\nOutputs → {args.output_dir}")
+    print("\nTop-k accuracy:")
+    for k in range(1, args.max_top_k + 1):
+        print(f"  Top-{k:2d}: {summary[f'top_{k}_accuracy']:.4f}")
+    print(f"Mean power loss (top {args.power_loss_k}): {summary[f'mean_power_loss_db_top{args.power_loss_k}']:.4f} dB")
+    print(f"Inference: {total_inf_time:.4f}s | {total_inf_time/max(total_samples,1):.8f}s per sample")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Federated regression of full 64-beam vector in dB scale.\n"
-            "Supports FedAvg, FedProx, and SCAFFOLD.\n\n"
-            "Typical usage:\n"
-            "  FedAvg  : --fl_method fedavg\n"
-            "  FedProx : --fl_method fedprox --fedprox_mu 0.01\n"
-            "  SCAFFOLD: --fl_method scaffold\n"
-        ),
+    p = argparse.ArgumentParser(
+        description="FedProx beam classification — 64-class GPS-to-beam prediction",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
     # Data
-    parser.add_argument("--train_folder", type=str, default="deepSense/train_sequences_scen1")
-    parser.add_argument("--test_folder",  type=str, default="deepSense/test_sequences_scen1")
-    parser.add_argument("--output_dir",   type=str, default="results_regression_db")
+    p.add_argument("--train_folder", default="deepSense/train_sequences_scen1")
+    p.add_argument("--test_folder",  default="deepSense/test_sequences_scen1")
+    p.add_argument("--output_dir",   default="results_classification_fedprox")
 
-    # Model
-    parser.add_argument("--nodes_per_layer", type=int,   default=256)
-    parser.add_argument("--layers",          type=int,   default=7)
-    parser.add_argument("--dropout",         type=float, default=0.1)
+    # Model — tuned for classification on small non-IID clients
+    p.add_argument("--nodes_per_layer", type=int,   default=128,
+                   help="128 nodes balances capacity vs. overfitting on small client datasets")
+    p.add_argument("--layers",          type=int,   default=4,
+                   help="4 layers is sufficient for the 2D GPS -> 64-class mapping")
+    p.add_argument("--dropout",         type=float, default=0.3)
+    p.add_argument("--no_batchnorm",    action="store_true",
+                   help="Disable BatchNorm (not recommended for non-IID FL)")
 
     # Optimisation
-    parser.add_argument("--batch_size",     type=int,   default=256)
-    parser.add_argument("--lr",             type=float, default=5e-4)
-    parser.add_argument("--decay_l2",       type=float, default=1e-5)
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    p.add_argument("--batch_size",      type=int,   default=64,
+                   help="Smaller batches help when clients have few samples per class")
+    p.add_argument("--lr",              type=float, default=1e-3)
+    p.add_argument("--decay_l2",        type=float, default=1e-4)
+    p.add_argument("--grad_clip_norm",  type=float, default=1.0)
+    p.add_argument("--label_smoothing", type=float, default=0.1,
+                   help="Label smoothing for cross-entropy — reduces overconfidence on sparse labels")
 
     # Federated
-    parser.add_argument("--rounds",        type=int,   default=150)
-    parser.add_argument("--local_epochs",  type=int,   default=5)
-    parser.add_argument("--fraction_fit",  type=float, default=1.0)
-    parser.add_argument(
-        "--fl_method",
-        type=str,
-        default="fedprox",
-        choices=["fedavg", "fedprox", "scaffold"],
-        help="Federated optimisation algorithm.",
-    )
-
-    # FedProx-specific
-    parser.add_argument(
-        "--fedprox_mu",
-        type=float,
-        default=0.01,
-        help=(
-            "Proximal penalty coefficient for FedProx (ignored by fedavg/scaffold).\n"
-            "Larger values constrain local updates more tightly to the global model.\n"
-            "Typical range: 0.001 – 1.0. Start with 0.01 and tune on validation set."
-        ),
-    )
-
-    # Loss
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1"])
+    p.add_argument("--rounds",       type=int,   default=150)
+    p.add_argument("--local_epochs", type=int,   default=5)
+    p.add_argument("--fraction_fit", type=float, default=1.0)
+    p.add_argument("--fedprox_mu",   type=float, default=0.01,
+                   help="Proximal penalty. Tune in range 0.001–0.1. Start with 0.01.")
 
     # Evaluation
-    parser.add_argument("--max_top_k",    type=int, default=10)
-    parser.add_argument("--power_loss_k", type=int, default=10)
+    p.add_argument("--max_top_k",    type=int, default=10)
+    p.add_argument("--power_loss_k", type=int, default=4)
 
     # Normalisation
-    parser.add_argument("--standardize_x",         action="store_true")
-    parser.add_argument("--standardize_target_db", action="store_true")
+    p.add_argument("--standardize_x", action="store_true")
 
     # Misc
-    parser.add_argument("--seed",          type=int, default=42)
-    parser.add_argument("--num_workers",   type=int, default=2)
-    parser.add_argument("--use_amp",       action="store_true")
-    parser.add_argument("--deterministic", action="store_true")
+    p.add_argument("--seed",          type=int, default=42)
+    p.add_argument("--num_workers",   type=int, default=2)
+    p.add_argument("--use_amp",       action="store_true")
+    p.add_argument("--deterministic", action="store_true")
 
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    if args.max_top_k < 1 or args.max_top_k > NUM_CLASSES:
+    if not (1 <= args.max_top_k <= NUM_CLASSES):
         raise ValueError(f"max_top_k must be in [1, {NUM_CLASSES}]")
-    if args.power_loss_k < 1 or args.power_loss_k > args.max_top_k:
+    if not (1 <= args.power_loss_k <= args.max_top_k):
         raise ValueError("power_loss_k must be in [1, max_top_k]")
-    if args.fraction_fit <= 0 or args.fraction_fit > 1.0:
+    if not (0 < args.fraction_fit <= 1.0):
         raise ValueError("fraction_fit must be in (0, 1]")
     if args.fedprox_mu < 0:
         raise ValueError("fedprox_mu must be non-negative")
@@ -900,59 +634,38 @@ def main() -> None:
     set_seed(args.seed)
 
     print(f"Device          : {device}")
-    print(f"Train folder    : {args.train_folder}")
-    print(f"Test folder     : {args.test_folder}")
-    print(f"FL method       : {args.fl_method}")
-    if args.fl_method == "fedprox":
-        print(f"FedProx mu      : {args.fedprox_mu}")
-    print(f"Loss            : {args.loss}")
-    print(f"Local optimiser : AdamW  lr={args.lr}  wd={args.decay_l2}")
+    print(f"FL method       : FedProx  mu={args.fedprox_mu}")
+    print(f"Architecture    : {args.layers} layers x {args.nodes_per_layer} nodes  "
+          f"dropout={args.dropout}  batchnorm={not args.no_batchnorm}")
+    print(f"Label smoothing : {args.label_smoothing}")
+    print(f"Batch size      : {args.batch_size}  (smaller = better for sparse per-client classes)")
 
+    x_mean, x_std = (compute_global_feature_stats(args.train_folder)
+                     if args.standardize_x else (None, None))
     if args.standardize_x:
-        x_mean, x_std = compute_global_feature_stats(args.train_folder)
         print(f"Feature stats   : mean={x_mean.tolist()}  std={x_std.tolist()}")
-    else:
-        x_mean, x_std = None, None
 
-    if args.standardize_target_db:
-        target_mean, target_std = compute_global_target_stats(args.train_folder)
-        print(f"Target dB stats : mean={target_mean:.4f}  std={target_std:.4f}")
-    else:
-        target_mean, target_std = None, None
-
-    global_model = BeamRegressor(
+    global_model = BeamClassifier(
         num_features=2,
-        num_outputs=NUM_CLASSES,
+        num_classes=NUM_CLASSES,
         nodes_per_layer=args.nodes_per_layer,
         n_layers=args.layers,
         dropout=args.dropout,
+        use_batchnorm=not args.no_batchnorm,
     ).to(device)
 
-    clients = build_clients(args, device, x_mean, x_std, target_mean, target_std)
+    total_params = sum(p.numel() for p in global_model.parameters())
+    print(f"Model params    : {total_params:,}")
+
+    clients = build_clients(args, device, x_mean, x_std)
     print(f"Clients         : {len(clients)}")
 
-    test_bundle = load_all_test_data(
-        test_folder=args.test_folder,
-        standardize_x=args.standardize_x,
-        x_mean=x_mean,
-        x_std=x_std,
-        target_mean=target_mean,
-        target_std=target_std,
-    )
+    test_bundle = load_all_test_data(args.test_folder, args.standardize_x, x_mean, x_std)
     print(f"Test samples    : {len(test_bundle.y_test_label)}")
 
-    global_model, _ = federated_train(args, clients, global_model)
+    global_model = federated_train(args, clients, global_model)
 
-    evaluate_and_save(
-        args=args,
-        global_model=global_model,
-        test_bundle=test_bundle,
-        device=device,
-        x_mean=x_mean,
-        x_std=x_std,
-        target_mean=target_mean,
-        target_std=target_std,
-    )
+    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std)
 
 
 if __name__ == "__main__":
