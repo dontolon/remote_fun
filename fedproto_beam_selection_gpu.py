@@ -767,7 +767,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--nodes_per_layer", type=int, default=256)
     parser.add_argument("--layers", type=int, default=7)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0)
 
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -778,7 +778,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_epochs", type=int, default=5)
     parser.add_argument("--fraction_fit", type=float, default=1.0)
 
-    parser.add_argument("--fl_method", type=str, default="scaffold", choices=["fedavg", "scaffold"])
+    parser.add_argument("--fl_method", type=str, default="fedavg", choices=["fedavg", "scaffold"])
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smoothl1"])
 
     parser.add_argument("--max_top_k", type=int, default=10)

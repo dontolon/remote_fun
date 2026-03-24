@@ -3,3 +3,8 @@
 /results
 /results_remote
 /fedproto_beam_selection.py
+/results_regression
+/results_regression_db
+/test_sequences_scen1
+/train_sequences_scen1
+/.gitignore
