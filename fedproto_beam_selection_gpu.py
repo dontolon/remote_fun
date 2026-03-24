@@ -6,7 +6,6 @@ import random
 import argparse
 from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import Optional
 import time
 import numpy as np
 import pandas as pd
@@ -111,20 +110,21 @@ class TestDatasetBundle:
         self,
         x_test: np.ndarray,
         y_test_label: np.ndarray,
-        y_test_norm_linear: np.ndarray,
-        y_test_linear: np.ndarray,
-        power_sums: np.ndarray,
+        y_test_pwr: np.ndarray,
         client_ids: list[str],
     ):
         self.x_test = x_test
         self.y_test_label = y_test_label
-        self.y_test_norm_linear = y_test_norm_linear
-        self.y_test_linear = y_test_linear
-        self.power_sums = power_sums
+        self.y_test_pwr = y_test_pwr   # raw pre-normalized power vectors
         self.client_ids = client_ids
 
 
 def load_client_arrays(csv_path: str):
+    """
+    Load pre-normalized data directly from CSV without any transformation.
+    The power columns are already in their final form — argmax gives the
+    optimal beam label, which is all classification needs.
+    """
     df = pd.read_csv(csv_path)
 
     for col in ("gps_lat", "gps_long"):
@@ -136,16 +136,8 @@ def load_client_arrays(csv_path: str):
         raise ValueError(f"Missing power columns in {csv_path}: {missing}")
 
     x = df[["gps_lat", "gps_long"]].values.astype(np.float32)
-    y_linear = df[PWR_COLS].values.astype(np.float32)
-
-    power_sum = (
-        df["power_sum"].values.astype(np.float32)
-        if "power_sum" in df.columns
-        else np.sum(y_linear, axis=1).astype(np.float32)
-    )
-
-    y_norm_linear = y_linear / (power_sum[:, None] + 1e-8)
-    y_label = np.argmax(y_linear, axis=1).astype(np.int64)
+    y_pwr = df[PWR_COLS].values.astype(np.float32)
+    y_label = np.argmax(y_pwr, axis=1).astype(np.int64)
 
     client_ids = (
         df["client_id"].astype(str).tolist()
@@ -153,28 +145,8 @@ def load_client_arrays(csv_path: str):
         else [os.path.basename(csv_path)] * len(df)
     )
 
-    return x, y_label, y_norm_linear, y_linear, power_sum, client_ids
+    return x, y_label, y_pwr, client_ids
 
-
-def compute_global_feature_stats(train_folder: str) -> tuple[np.ndarray, np.ndarray]:
-    train_paths = sorted(glob.glob(os.path.join(train_folder, "*.csv")))
-    if not train_paths:
-        raise FileNotFoundError(f"No CSVs found in {train_folder}")
-
-    total, sum_x, sum_x2 = 0, np.zeros(2, np.float64), np.zeros(2, np.float64)
-    for p in train_paths:
-        x = pd.read_csv(p, usecols=["gps_lat", "gps_long"]).values.astype(np.float64)
-        total += x.shape[0]
-        sum_x += x.sum(0)
-        sum_x2 += (x ** 2).sum(0)
-
-    mean = sum_x / max(total, 1)
-    std = np.sqrt(np.maximum(sum_x2 / max(total, 1) - mean ** 2, 1e-12))
-    return mean.astype(np.float32), std.astype(np.float32)
-
-
-def normalize_features(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return ((x - mean[None, :]) / np.clip(std[None, :], 1e-8, None)).astype(np.float32)
 
 
 def make_dataloader(
@@ -238,23 +210,24 @@ def weighted_mean(values: list[float], weights: list[int]) -> float:
 
 def compute_power_loss_db(
     selected_indices: list[int],
-    true_vec_norm: np.ndarray,
-    power_sum: float,
+    y_pwr: np.ndarray,
 ) -> float:
+    """
+    Power loss in dB between the best selected beam and the true optimal beam.
+    y_pwr is the pre-normalized power vector read directly from the CSV.
+    """
     if not selected_indices:
         return np.nan
-    true_vec = true_vec_norm * power_sum
-    noise = np.min(true_vec) / 2.0
-    measured = np.max(true_vec[np.asarray(selected_indices, np.int64)])
-    true_max = np.max(true_vec)
-    if measured - noise <= 0:
+    measured = np.max(y_pwr[np.asarray(selected_indices, np.int64)])
+    true_max = np.max(y_pwr)
+    if measured <= 0 or true_max <= 0:
         return np.nan
-    return float(10.0 * np.log10((true_max - noise) / (measured - noise)))
+    return float(10.0 * np.log10(true_max / measured))
 
 
 def clone_state_dict(
     sd: dict[str, torch.Tensor],
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> dict[str, torch.Tensor]:
     return {k: (v.detach().clone().to(device) if device else v.detach().clone()) for k, v in sd.items()}
 
@@ -358,8 +331,6 @@ class BeamClient:
 def build_clients(
     args: argparse.Namespace,
     device: torch.device,
-    x_mean: Optional[np.ndarray],
-    x_std: Optional[np.ndarray],
 ) -> list[BeamClient]:
     train_paths = sorted(glob.glob(os.path.join(args.train_folder, "*.csv")))
     if not train_paths:
@@ -367,11 +338,7 @@ def build_clients(
 
     clients = []
     for csv_path in train_paths:
-        x, y_label, _, _, _, cids = load_client_arrays(csv_path)
-
-        if args.standardize_x:
-            x = normalize_features(x, x_mean, x_std)
-
+        x, y_label, _, cids = load_client_arrays(csv_path)
         client_id = cids[0] if cids else f"client_{len(clients)}"
 
         loader = make_dataloader(
@@ -397,32 +364,24 @@ def build_clients(
     return clients
 
 
-def load_all_test_data(
-    test_folder: str,
-    standardize_x: bool,
-    x_mean: Optional[np.ndarray],
-    x_std: Optional[np.ndarray],
-) -> TestDatasetBundle:
+def load_all_test_data(test_folder: str) -> TestDatasetBundle:
     test_paths = sorted(glob.glob(os.path.join(test_folder, "*.csv")))
     if not test_paths:
         raise FileNotFoundError(f"No CSVs in {test_folder}")
 
-    xs, ys_label, ys_norm, ys_lin, psums, cids = [], [], [], [], [], []
+    xs, ys_label, ys_pwr, cids = [], [], [], []
 
     for p in test_paths:
-        x, y_label, y_norm, y_lin, ps, ids = load_client_arrays(p)
-        if standardize_x:
-            x = normalize_features(x, x_mean, x_std)
-        xs.append(x); ys_label.append(y_label)
-        ys_norm.append(y_norm); ys_lin.append(y_lin)
-        psums.append(ps); cids.extend(ids)
+        x, y_label, y_pwr, ids = load_client_arrays(p)
+        xs.append(x)
+        ys_label.append(y_label)
+        ys_pwr.append(y_pwr)
+        cids.extend(ids)
 
     return TestDatasetBundle(
         x_test=np.vstack(xs),
         y_test_label=np.concatenate(ys_label),
-        y_test_norm_linear=np.vstack(ys_norm),
-        y_test_linear=np.vstack(ys_lin),
-        power_sums=np.concatenate(psums),
+        y_test_pwr=np.vstack(ys_pwr),
         client_ids=cids,
     )
 
@@ -464,8 +423,6 @@ def evaluate_and_save(
     global_model: nn.Module,
     test_bundle: TestDatasetBundle,
     device: torch.device,
-    x_mean: Optional[np.ndarray],
-    x_std: Optional[np.ndarray],
 ) -> None:
     global_model.eval()
     global_model.to(device)
@@ -510,11 +467,10 @@ def evaluate_and_save(
                     "selected_indices_topk": json.dumps(selected_topk),
                     "true_best": true_best,
                     "predicted_best": selected_topk[0],
-                    "best_power": float(test_bundle.y_test_linear[gi, true_best]),
+                    "best_power": float(test_bundle.y_test_pwr[gi, true_best]),
                     f"power_loss_db_top{args.power_loss_k}": compute_power_loss_db(
                         selected_topk[: args.power_loss_k],
-                        test_bundle.y_test_norm_linear[gi],
-                        float(test_bundle.power_sums[gi]),
+                        test_bundle.y_test_pwr[gi],
                     ),
                 }
                 for k in range(1, args.max_top_k + 1):
@@ -547,13 +503,8 @@ def evaluate_and_save(
         os.path.join(args.output_dir, "summary.csv"), index=False
     )
 
-    run_cfg = vars(args).copy()
-    if x_mean is not None:
-        run_cfg["x_mean"] = x_mean.tolist()
-    if x_std is not None:
-        run_cfg["x_std"] = x_std.tolist()
     with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
-        json.dump(run_cfg, f, indent=2)
+        json.dump(vars(args), f, indent=2)
 
     torch.save(global_model.state_dict(), os.path.join(args.output_dir, "global_model.pt"))
 
@@ -605,9 +556,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_top_k",    type=int, default=10)
     p.add_argument("--power_loss_k", type=int, default=4)
 
-    # Normalisation
-    p.add_argument("--standardize_x", action="store_true")
-
     # Misc
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_workers",   type=int, default=2)
@@ -638,12 +586,7 @@ def main() -> None:
     print(f"Architecture    : {args.layers} layers x {args.nodes_per_layer} nodes  "
           f"dropout={args.dropout}  batchnorm={not args.no_batchnorm}")
     print(f"Label smoothing : {args.label_smoothing}")
-    print(f"Batch size      : {args.batch_size}  (smaller = better for sparse per-client classes)")
-
-    x_mean, x_std = (compute_global_feature_stats(args.train_folder)
-                     if args.standardize_x else (None, None))
-    if args.standardize_x:
-        print(f"Feature stats   : mean={x_mean.tolist()}  std={x_std.tolist()}")
+    print(f"Batch size      : {args.batch_size}")
 
     global_model = BeamClassifier(
         num_features=2,
@@ -654,18 +597,17 @@ def main() -> None:
         use_batchnorm=not args.no_batchnorm,
     ).to(device)
 
-    total_params = sum(p.numel() for p in global_model.parameters())
-    print(f"Model params    : {total_params:,}")
+    print(f"Model params    : {sum(p.numel() for p in global_model.parameters()):,}")
 
-    clients = build_clients(args, device, x_mean, x_std)
+    clients = build_clients(args, device)
     print(f"Clients         : {len(clients)}")
 
-    test_bundle = load_all_test_data(args.test_folder, args.standardize_x, x_mean, x_std)
+    test_bundle = load_all_test_data(args.test_folder)
     print(f"Test samples    : {len(test_bundle.y_test_label)}")
 
     global_model = federated_train(args, clients, global_model)
 
-    evaluate_and_save(args, global_model, test_bundle, device, x_mean, x_std)
+    evaluate_and_save(args, global_model, test_bundle, device)
 
 
 if __name__ == "__main__":
